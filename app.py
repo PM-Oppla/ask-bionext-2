@@ -128,16 +128,52 @@ def is_approved_url(url):
         or url.startswith("[ict.ipbes.net](https://ict.ipbes.net/ipbes-ict-guide/data-and-knowledge-management/citations-of-ipbes-assessments/)")
     )
 
+def make_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/pdf,*/*;q=0.8",
+        "Accept-Language": "en-GB,en;q=0.9",
+    }
+
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_live_text(url):
     if not is_approved_url(url):
-        return None
+        return {
+            "ok": False,
+            "url": url,
+            "error": "URL is outside the approved source boundary.",
+        }
+
+    result = {
+        "ok": False,
+        "requested_url": url,
+        "final_url": "",
+        "status_code": "",
+        "content_type": "",
+        "response_bytes": 0,
+        "title": "",
+        "text": "",
+        "chars": 0,
+        "links": [],
+        "approved_links": [],
+        "resource_links": [],
+        "pdf_links": [],
+        "raw_preview": "",
+        "text_preview": "",
+        "error": "",
+    }
 
     try:
-        r = requests.get(url, headers={"User-Agent": "AskBIONEXT2"}, timeout=20)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
+        r = requests.get(url, headers=make_headers(), timeout=25, allow_redirects=True)
+        result["final_url"] = r.url
+        result["status_code"] = r.status_code
+        result["content_type"] = r.headers.get("content-type", "")
+        result["response_bytes"] = len(r.content)
+        result["raw_preview"] = r.text[:1000] if r.text else ""
 
+        r.raise_for_status()
+
+        soup = BeautifulSoup(r.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
 
@@ -145,40 +181,67 @@ def fetch_live_text(url):
         text = soup.get_text("\n", strip=True)
         text = re.sub(r"\n{3,}", "\n\n", text)
 
-        links = []
+        all_links = []
         for a in soup.find_all("a", href=True):
             link = requests.compat.urljoin(url, a["href"]).split("#")[0]
-            if is_approved_url(link):
-                links.append(link)
+            all_links.append(link)
 
-        links = list(dict.fromkeys(links))
+        approved_links = [x for x in all_links if is_approved_url(x)]
+        approved_links = list(dict.fromkeys(approved_links))
 
-        return {
-            "title": title,
-            "url": url,
-            "text": text,
-            "links": links,
-            "chars": len(text),
-        }
+        resource_links = [x for x in approved_links if "/bionext/resource/" in x]
+        pdf_links = [x for x in approved_links if ".pdf" in x.lower()]
+
+        result["ok"] = True
+        result["title"] = title
+        result["text"] = text
+        result["chars"] = len(text)
+        result["links"] = list(dict.fromkeys(all_links))
+        result["approved_links"] = approved_links
+        result["resource_links"] = resource_links
+        result["pdf_links"] = pdf_links
+        result["text_preview"] = text[:1000]
 
     except Exception as e:
-        return {
-            "title": "Fetch failed",
-            "url": url,
-            "text": "",
-            "links": [],
-            "chars": 0,
-            "error": str(e),
-        }
+        result["error"] = str(e)
+
+    return result
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_pdf_text(url):
     if not is_approved_url(url):
-        return None
+        return {
+            "ok": False,
+            "url": url,
+            "error": "URL is outside the approved source boundary.",
+        }
+
+    result = {
+        "ok": False,
+        "requested_url": url,
+        "final_url": "",
+        "status_code": "",
+        "content_type": "",
+        "downloaded_bytes": 0,
+        "title": url.split("/")[-1],
+        "text": "",
+        "chars": 0,
+        "pages_checked": 0,
+        "raw_start": "",
+        "text_preview": "",
+        "error": "",
+    }
 
     try:
-        r = requests.get(url, headers={"User-Agent": "AskBIONEXT2"}, timeout=30)
+        r = requests.get(url, headers=make_headers(), timeout=40, allow_redirects=True)
+        result["final_url"] = r.url
+        result["status_code"] = r.status_code
+        result["content_type"] = r.headers.get("content-type", "")
+        result["downloaded_bytes"] = len(r.content)
+        result["raw_start"] = r.content[:20].hex()
+
         r.raise_for_status()
+
         reader = pypdf.PdfReader(io.BytesIO(r.content))
         pages = []
         for page in reader.pages[:30]:
@@ -187,23 +250,16 @@ def fetch_pdf_text(url):
         text = "\n\n".join(pages)
         text = re.sub(r"\n{3,}", "\n\n", text)
 
-        return {
-            "title": url.split("/")[-1],
-            "url": url,
-            "text": text,
-            "chars": len(text),
-            "pages_checked": min(len(reader.pages), 30),
-        }
+        result["ok"] = True
+        result["pages_checked"] = min(len(reader.pages), 30)
+        result["text"] = text
+        result["chars"] = len(text)
+        result["text_preview"] = text[:1000]
 
     except Exception as e:
-        return {
-            "title": "PDF extraction failed",
-            "url": url,
-            "text": "",
-            "chars": 0,
-            "pages_checked": 0,
-            "error": str(e),
-        }
+        result["error"] = str(e)
+
+    return result
 
 def route_question(question):
     q = question.lower()
@@ -235,10 +291,10 @@ def gather_sources(question):
 
     for url in LIVE_URLS:
         live = fetch_live_text(url)
-        if live and live.get("chars", 0) > 500:
+        if live and live.get("ok") and live.get("chars", 0) > 500:
             sources.append({
                 "title": live["title"],
-                "url": live["url"],
+                "url": live["requested_url"],
                 "text": live["text"][:5000],
             })
 
@@ -280,88 +336,61 @@ def generate_answer(question):
 
     return response.choices[0].message.content, route, sources
 
-st.markdown("""
-<div class="header">
-  <h1>Ask BIONEXT 2.0</h1>
-  <p>Agentic prototype for source-bounded BIONEXT research exploration</p>
-</div>
-""", unsafe_allow_html=True)
+def show_page_diagnostics(result):
+    st.write("**Requested URL:**")
+    st.write(result.get("requested_url", ""))
+    st.write("**Final URL:**")
+    st.write(result.get("final_url", ""))
+    st.write("**Status code:**")
+    st.write(result.get("status_code", ""))
+    st.write("**Content type:**")
+    st.write(result.get("content_type", ""))
+    st.write("**Response bytes:**")
+    st.write(result.get("response_bytes", 0))
+    st.write("**Extracted characters:**")
+    st.write(result.get("chars", 0))
+    st.write("**Total links found:**")
+    st.write(len(result.get("links", [])))
+    st.write("**Approved links found:**")
+    st.write(len(result.get("approved_links", [])))
+    st.write("**Resource page links found:**")
+    st.write(len(result.get("resource_links", [])))
+    st.write("**PDF links found:**")
+    st.write(len(result.get("pdf_links", [])))
 
-with st.sidebar:
-    st.title("Ask BIONEXT 2.0")
-    st.write("This prototype answers only from approved BIONEXT and selected external sources.")
+    if result.get("error"):
+        st.write("**Error:**")
+        st.code(result.get("error", ""))
 
-    st.markdown("### Approved source areas")
-    st.write("- BIONEXT on Oppla")
-    st.write("- BIONEXT resources")
-    st.write("- BIONEXT decision-analysis pages")
-    st.write("- CORDIS BIONEXT project page")
-    st.write("- selected IPBES page")
+    if result.get("resource_links"):
+        st.write("**Example resource links:**")
+        for link in result.get("resource_links", [])[:5]:
+            st.write(link)
 
-    st.markdown("---")
-    st.markdown("### Diagnostics")
+    if result.get("pdf_links"):
+        st.write("**Example PDF links:**")
+        for link in result.get("pdf_links", [])[:5]:
+            st.write(link)
 
-    if st.button("Test BIONEXT resources page"):
-        result = fetch_live_text(BIONEXT_RESOURCES_URL)
-        if result:
-            st.write("**URL:**")
-            st.write(result["url"])
-            st.write("**Title:**")
-            st.write(result["title"])
-            st.write("**Characters extracted:**")
-            st.write(result.get("chars", 0))
-            st.write("**Approved links found:**")
-            st.write(len(result.get("links", [])))
+    st.write("**Extracted text preview:**")
+    st.text(result.get("text_preview", "")[:1000])
 
-            resource_links = [x for x in result.get("links", []) if "/bionext/resource/" in x]
-            pdf_links = [x for x in result.get("links", []) if x.lower().endswith(".pdf")]
+    st.write("**Raw response preview:**")
+    st.text(result.get("raw_preview", "")[:1000])
 
-            st.write("**Resource page links found:**")
-            st.write(len(resource_links))
-            st.write("**PDF links found directly on page:**")
-            st.write(len(pdf_links))
-
-            st.write("**Text preview:**")
-            st.text(result.get("text", "")[:1000])
-        else:
-            st.error("The resources page could not be tested.")
-
-    if st.button("Test known BIONEXT PDF"):
-        result = fetch_pdf_text(KNOWN_BIONEXT_PDF_URL)
-        if result:
-            st.write("**URL:**")
-            st.write(result["url"])
-            st.write("**Title:**")
-            st.write(result["title"])
-            st.write("**Pages checked:**")
-            st.write(result.get("pages_checked", 0))
-            st.write("**Characters extracted:**")
-            st.write(result.get("chars", 0))
-            st.write("**Text preview:**")
-            st.text(result.get("text", "")[:1000])
-        else:
-            st.error("The PDF could not be tested.")
-
-st.write("Ask a question about BIONEXT. The app will choose a source route and answer with citations.")
-
-question = st.text_input(
-    "Question",
-    placeholder="e.g. What is BIONEXT and what problem is it trying to address?",
-)
-
-if st.button("Ask BIONEXT") and question.strip():
-    if not get_api_key():
-        st.error("No OpenAI API key found. Add OPENAI_API_KEY in Streamlit Secrets.")
-    else:
-        with st.spinner("Searching approved BIONEXT sources..."):
-            try:
-                answer, route, sources = generate_answer(question)
-                st.markdown(f"**Agent route:** {route}")
-                st.markdown(f'<div class="answer">{answer}</div>', unsafe_allow_html=True)
-
-                with st.expander("Sources checked"):
-                    for source in sources:
-                        st.write(f"**{source['title']}**")
-                        st.write(source["url"])
-            except Exception as e:
-                st.error(f"Something went wrong: {e}")
+def show_pdf_diagnostics(result):
+    st.write("**Requested URL:**")
+    st.write(result.get("requested_url", ""))
+    st.write("**Final URL:**")
+    st.write(result.get("final_url", ""))
+    st.write("**Status code:**")
+    st.write(result.get("status_code", ""))
+    st.write("**Content type:**")
+    st.write(result.get("content_type", ""))
+    st.write("**Downloaded bytes:**")
+    st.write(result.get("downloaded_bytes", 0))
+    st.write("**First 20 bytes, hex:**")
+    st.code(result.get("raw_start", ""))
+    st.write("**Pages checked:**")
+    st.write(result.get("pages_checked", 0))
+    st.write
