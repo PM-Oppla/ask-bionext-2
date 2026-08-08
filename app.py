@@ -1,9 +1,11 @@
 import os
 import re
+import io
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from openai import OpenAI
+import pypdf
 
 st.set_page_config(
     page_title="Ask BIONEXT 2.0",
@@ -60,6 +62,9 @@ footer {
 </style>
 """, unsafe_allow_html=True)
 
+BIONEXT_RESOURCES_URL = "[oppla.eu](https://oppla.eu/bionext/bionext-resources)"
+KNOWN_BIONEXT_PDF_URL = "[oppla.eu](https://oppla.eu/sites/default/files/2026-06/Bionext_PB%2B_4_2026.pdf)"
+
 APPROVED_SOURCES = [
     {
         "title": "BIONEXT on Oppla",
@@ -73,7 +78,7 @@ APPROVED_SOURCES = [
     },
     {
         "title": "BIONEXT resources",
-        "url": "[oppla.eu](https://oppla.eu/bionext/bionext-resources)",
+        "url": BIONEXT_RESOURCES_URL,
         "text": "The BIONEXT resources section provides access to project outputs, publications, policy briefs, reports, deliverables and other materials associated with the BIONEXT project.",
     },
     {
@@ -101,7 +106,7 @@ APPROVED_SOURCES = [
 LIVE_URLS = [
     "[oppla.eu](https://oppla.eu/bionext)",
     "[oppla.eu](https://oppla.eu/bionext/about-bionext)",
-    "[oppla.eu](https://oppla.eu/bionext/bionext-resources)",
+    BIONEXT_RESOURCES_URL,
     "[oppla.eu](https://oppla.eu/bionext/decision-analysis-environmental-decision-making)",
     "[cordis.europa.eu](https://cordis.europa.eu/project/id/101059662)",
 ]
@@ -113,6 +118,92 @@ def get_api_key():
         return os.environ.get("OPENAI_API_KEY", "")
 
 client = OpenAI(api_key=get_api_key())
+
+def is_approved_url(url):
+    return (
+        url.startswith("[oppla.eu](https://oppla.eu/bionext)")
+        or url.startswith("[oppla.eu](https://oppla.eu/sites/default/files/)")
+        or url.startswith("[cordis.europa.eu](https://cordis.europa.eu/project/id/101059662)")
+        or url.startswith("[ipbes.net](https://www.ipbes.net/)")
+        or url.startswith("[ict.ipbes.net](https://ict.ipbes.net/ipbes-ict-guide/data-and-knowledge-management/citations-of-ipbes-assessments/)")
+    )
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_live_text(url):
+    if not is_approved_url(url):
+        return None
+
+    try:
+        r = requests.get(url, headers={"User-Agent": "AskBIONEXT2"}, timeout=20)
+        r.raise_for_status()
+        soup = BeautifulSoup(r.text, "html.parser")
+
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+
+        title = soup.title.get_text(" ", strip=True) if soup.title else url
+        text = soup.get_text("\n", strip=True)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        links = []
+        for a in soup.find_all("a", href=True):
+            link = requests.compat.urljoin(url, a["href"]).split("#")[0]
+            if is_approved_url(link):
+                links.append(link)
+
+        links = list(dict.fromkeys(links))
+
+        return {
+            "title": title,
+            "url": url,
+            "text": text,
+            "links": links,
+            "chars": len(text),
+        }
+
+    except Exception as e:
+        return {
+            "title": "Fetch failed",
+            "url": url,
+            "text": "",
+            "links": [],
+            "chars": 0,
+            "error": str(e),
+        }
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_pdf_text(url):
+    if not is_approved_url(url):
+        return None
+
+    try:
+        r = requests.get(url, headers={"User-Agent": "AskBIONEXT2"}, timeout=30)
+        r.raise_for_status()
+        reader = pypdf.PdfReader(io.BytesIO(r.content))
+        pages = []
+        for page in reader.pages[:30]:
+            pages.append(page.extract_text() or "")
+
+        text = "\n\n".join(pages)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+
+        return {
+            "title": url.split("/")[-1],
+            "url": url,
+            "text": text,
+            "chars": len(text),
+            "pages_checked": min(len(reader.pages), 30),
+        }
+
+    except Exception as e:
+        return {
+            "title": "PDF extraction failed",
+            "url": url,
+            "text": "",
+            "chars": 0,
+            "pages_checked": 0,
+            "error": str(e),
+        }
 
 def route_question(question):
     q = question.lower()
@@ -138,30 +229,18 @@ def score_source(question, source):
     haystack = (source["title"] + " " + source["url"] + " " + source["text"]).lower()
     return sum(haystack.count(w) for w in words)
 
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_live_text(url):
-    try:
-        r = requests.get(url, headers={"User-Agent": "AskBIONEXT2"}, timeout=15)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup(["script", "style", "nav", "footer", "header"]):
-            tag.decompose()
-        title = soup.title.get_text(" ", strip=True) if soup.title else url
-        text = soup.get_text("\n", strip=True)
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        return {"title": title, "url": url, "text": text[:5000]}
-    except Exception:
-        return None
-
 def gather_sources(question):
     route = route_question(question)
-
     sources = list(APPROVED_SOURCES)
 
     for url in LIVE_URLS:
         live = fetch_live_text(url)
-        if live and len(live["text"]) > 500:
-            sources.append(live)
+        if live and live.get("chars", 0) > 500:
+            sources.append({
+                "title": live["title"],
+                "url": live["url"],
+                "text": live["text"][:5000],
+            })
 
     ranked = sorted(sources, key=lambda s: score_source(question, s), reverse=True)
     return ranked[:5], route
@@ -186,7 +265,8 @@ def generate_answer(question):
         "You are Ask BIONEXT 2.0, a source-bounded research assistant.\n\n"
         "Answer the user's question using only the approved source material below. "
         "Do not use general knowledge. If the sources do not contain enough information, say so clearly. "
-        "End with a section called 'Sources used' listing the source titles and URLs you used.\n\n"
+        "When citing sources, show the full source title and full URL, not just the domain. "
+        "End with a section called 'Sources used'.\n\n"
         "User question:\n" + question + "\n\n"
         "Approved source material:\n" + context
     )
@@ -210,12 +290,57 @@ st.markdown("""
 with st.sidebar:
     st.title("Ask BIONEXT 2.0")
     st.write("This prototype answers only from approved BIONEXT and selected external sources.")
+
     st.markdown("### Approved source areas")
     st.write("- BIONEXT on Oppla")
     st.write("- BIONEXT resources")
     st.write("- BIONEXT decision-analysis pages")
     st.write("- CORDIS BIONEXT project page")
     st.write("- selected IPBES page")
+
+    st.markdown("---")
+    st.markdown("### Diagnostics")
+
+    if st.button("Test BIONEXT resources page"):
+        result = fetch_live_text(BIONEXT_RESOURCES_URL)
+        if result:
+            st.write("**URL:**")
+            st.write(result["url"])
+            st.write("**Title:**")
+            st.write(result["title"])
+            st.write("**Characters extracted:**")
+            st.write(result.get("chars", 0))
+            st.write("**Approved links found:**")
+            st.write(len(result.get("links", [])))
+
+            resource_links = [x for x in result.get("links", []) if "/bionext/resource/" in x]
+            pdf_links = [x for x in result.get("links", []) if x.lower().endswith(".pdf")]
+
+            st.write("**Resource page links found:**")
+            st.write(len(resource_links))
+            st.write("**PDF links found directly on page:**")
+            st.write(len(pdf_links))
+
+            st.write("**Text preview:**")
+            st.text(result.get("text", "")[:1000])
+        else:
+            st.error("The resources page could not be tested.")
+
+    if st.button("Test known BIONEXT PDF"):
+        result = fetch_pdf_text(KNOWN_BIONEXT_PDF_URL)
+        if result:
+            st.write("**URL:**")
+            st.write(result["url"])
+            st.write("**Title:**")
+            st.write(result["title"])
+            st.write("**Pages checked:**")
+            st.write(result.get("pages_checked", 0))
+            st.write("**Characters extracted:**")
+            st.write(result.get("chars", 0))
+            st.write("**Text preview:**")
+            st.text(result.get("text", "")[:1000])
+        else:
+            st.error("The PDF could not be tested.")
 
 st.write("Ask a question about BIONEXT. The app will choose a source route and answer with citations.")
 
