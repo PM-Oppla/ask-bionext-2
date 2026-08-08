@@ -232,6 +232,27 @@ with st.sidebar:
     st.write("- CORDIS BIONEXT project page")
     st.write("- selected IPBES page")
 
+    st.markdown("---")
+    st.markdown("### Diagnostics")
+
+    if st.button("Test BIONEXT resources page"):
+        test_url = "[oppla.eu](https://oppla.eu/bionext/bionext-resources)"
+        test_result = fetch_live_text(test_url)
+
+        if test_result:
+            st.write("**Fetch result:** success")
+            st.write("**URL:**")
+            st.write(test_result["url"])
+            st.write("**Title:**")
+            st.write(test_result["title"])
+            st.write("**Characters extracted:**")
+            st.write(len(test_result["text"]))
+            st.write("**Text preview:**")
+            st.text(test_result["text"][:500])
+        else:
+            st.write("**Fetch result:** failed")
+            st.write("The app could not extract text from the BIONEXT resources page.")
+
 st.write("Ask a question about BIONEXT. The app will choose a source route and answer with citations.")
 
 question = st.text_input(
