@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
@@ -106,6 +107,30 @@ LIVE_URLS = [
     "[cordis.europa.eu](https://cordis.europa.eu/project/id/101059662)",
 ]
 
+def load_sources_from_json():
+    try:
+        with open("sources.json", "r", encoding="utf-8") as f:
+            sources = json.load(f)
+
+        clean_sources = []
+        for source in sources:
+            title = source.get("title", "").strip()
+            url = source.get("url", "").strip()
+            text = source.get("text", "").strip()
+
+            if title and url and text:
+                clean_sources.append({
+                    "title": title,
+                    "url": url,
+                    "text": text,
+                    "source_type": source.get("source_type", "Approved source"),
+                })
+
+        return clean_sources
+
+    except Exception:
+        return []
+
 def get_api_key():
     try:
         return st.secrets.get("OPENAI_API_KEY", "") or os.environ.get("OPENAI_API_KEY", "")
@@ -135,16 +160,27 @@ def score_source(question, source):
     words = re.findall(r"[a-zA-Z][a-zA-Z-]{3,}", question.lower())
     stop_words = {
         "what", "when", "where", "which", "about", "does",
-        "from", "with", "that", "this", "there", "their"
+        "from", "with", "that", "this", "there", "their",
+        "your", "allowed", "sources", "source", "use", "using"
     }
     words = [w for w in words if w not in stop_words]
-    haystack = (source["title"] + " " + source["url"] + " " + source["text"]).lower()
+
+    haystack = (
+        source.get("title", "") + " "
+        + source.get("url", "") + " "
+        + source.get("text", "")
+    ).lower()
+
     return sum(haystack.count(w) for w in words)
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_live_text(url):
     try:
-        r = requests.get(url, headers={"User-Agent": "AskBIONEXT2"}, timeout=15)
+        r = requests.get(
+            url,
+            headers={"User-Agent": "AskBIONEXT2"},
+            timeout=15,
+        )
         r.raise_for_status()
 
         soup = BeautifulSoup(r.text, "html.parser")
@@ -160,6 +196,7 @@ def fetch_live_text(url):
             "title": title,
             "url": url,
             "text": text[:5000],
+            "source_type": "Live web extraction",
         }
 
     except Exception:
@@ -168,7 +205,9 @@ def fetch_live_text(url):
 def gather_sources(question):
     route = route_question(question)
 
-    sources = list(APPROVED_SOURCES)
+    sources = load_sources_from_json()
+    if not sources:
+        sources = list(APPROVED_SOURCES)
 
     for url in LIVE_URLS:
         live = fetch_live_text(url)
@@ -182,12 +221,16 @@ def make_context(sources):
     chunks = []
 
     for i, source in enumerate(sources, start=1):
+        source_type = source.get("source_type", "Approved source")
+
         chunk = (
             "SOURCE " + str(i) + "\n"
             + "Title: " + source["title"] + "\n"
             + "URL: " + source["url"] + "\n"
+            + "Source type: " + source_type + "\n"
             + "Text: " + source["text"][:3500]
         )
+
         chunks.append(chunk)
 
     return "\n\n---\n\n".join(chunks)
@@ -200,7 +243,8 @@ def generate_answer(question):
         "You are Ask BIONEXT 2.0, a source-bounded research assistant.\n\n"
         "Answer the user's question using only the approved source material below. "
         "Do not use general knowledge. If the sources do not contain enough information, say so clearly. "
-        "End with a section called 'Sources used' listing the source titles and URLs you used.\n\n"
+        "When listing citations, use the full source title and full URL. "
+        "End every answer with a section called 'Sources used'.\n\n"
         "User question:\n" + question + "\n\n"
         "Approved source material:\n" + context
     )
@@ -223,7 +267,7 @@ st.markdown("""
 
 with st.sidebar:
     st.title("Ask BIONEXT 2.0")
-    st.write("This prototype answers only from approved BIONEXT and selected external sources.")
+    st.write("This prototype answers from the approved Ask BIONEXT 2.0 source database.")
 
     st.markdown("### Approved source areas")
     st.write("- BIONEXT on Oppla")
@@ -233,25 +277,13 @@ with st.sidebar:
     st.write("- selected IPBES page")
 
     st.markdown("---")
-    st.markdown("### Diagnostics")
+    st.markdown("### Source database")
 
-    if st.button("Test BIONEXT resources page"):
-        test_url = "[oppla.eu](https://oppla.eu/bionext/bionext-resources)"
-        test_result = fetch_live_text(test_url)
-
-        if test_result:
-            st.write("**Fetch result:** success")
-            st.write("**URL:**")
-            st.write(test_result["url"])
-            st.write("**Title:**")
-            st.write(test_result["title"])
-            st.write("**Characters extracted:**")
-            st.write(len(test_result["text"]))
-            st.write("**Text preview:**")
-            st.text(test_result["text"][:500])
-        else:
-            st.write("**Fetch result:** failed")
-            st.write("The app could not extract text from the BIONEXT resources page.")
+    loaded_sources = load_sources_from_json()
+    if loaded_sources:
+        st.success(f"{len(loaded_sources)} sources loaded from sources.json")
+    else:
+        st.warning("Using built-in fallback sources")
 
 st.write("Ask a question about BIONEXT. The app will choose a source route and answer with citations.")
 
@@ -275,6 +307,7 @@ if st.button("Ask BIONEXT") and question.strip():
                     for source in sources:
                         st.write(f"**{source['title']}**")
                         st.write(source["url"])
+                        st.caption(source.get("source_type", "Approved source"))
 
             except Exception as e:
                 st.error(f"Something went wrong: {e}")
