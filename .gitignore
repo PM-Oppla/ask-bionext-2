@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
+
+# Local diagnostic files
+bionext_resources_page.html
+
+# Visual Studio Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
