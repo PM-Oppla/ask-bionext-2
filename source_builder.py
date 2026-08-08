@@ -2,8 +2,10 @@ import hashlib
 import io
 import json
 import re
-import requests
+import time
+
 import pypdf
+import requests
 
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, unquote
@@ -11,44 +13,37 @@ from urllib.parse import urljoin, urlparse, unquote
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# Source Builder v3
+# Source Builder v5
 #
-# Builds sources.json from:
-# - approved BIONEXT / Oppla pages
-# - linked BIONEXT pages
-# - linked PDF documents
-# - approved external sources
+# Sources:
+# - recursively discovered pages within /bionext
+# - authoritative BIONEXT resource API (group 202)
+# - individual BIONEXT resource pages
+# - PDFs linked from BIONEXT pages/resources
+# - selected approved external sources
 #
-# Long documents are broken into smaller chunks to improve retrieval.
+# Long documents are chunked for semantic retrieval.
 # -------------------------------------------------------------------
 
 
+BIONEXT_ROOT = "https://oppla.eu/bionext"
+
+BIONEXT_RESOURCE_API = (
+    "https://oppla.eu/api/resources/groups/202"
+)
+
+NODE_BASE = "https://oppla.eu/node/"
+
+
 START_PAGES = [
-    {
-        "title": "BIONEXT on Oppla",
-        "url": "https://oppla.eu/bionext",
-        "source_type": "Oppla BIONEXT page",
-    },
-    {
-        "title": "About BIONEXT",
-        "url": "https://oppla.eu/bionext/about-bionext",
-        "source_type": "Oppla BIONEXT page",
-    },
-    {
-        "title": "BIONEXT Resources",
-        "url": "https://oppla.eu/bionext/bionext-resources",
-        "source_type": "Oppla BIONEXT resources page",
-    },
-    {
-        "title": "Decision analysis in environmental decision-making",
-        "url": "https://oppla.eu/bionext/decision-analysis-environmental-decision-making",
-        "source_type": "Oppla BIONEXT decision-analysis page",
-    },
-    {
-        "title": "BIONEXT News Articles",
-        "url": "https://oppla.eu/bionext/bionext-news-articles",
-        "source_type": "Oppla BIONEXT news page",
-    },
+    "https://oppla.eu/bionext",
+    "https://oppla.eu/bionext/about-bionext",
+    "https://oppla.eu/bionext/bionext-resources",
+    (
+        "https://oppla.eu/bionext/"
+        "decision-analysis-environmental-decision-making"
+    ),
+    "https://oppla.eu/bionext/bionext-news-articles",
 ]
 
 
@@ -59,26 +54,135 @@ EXTERNAL_SOURCES = [
         "source_type": "Approved external source",
     },
     {
-        "title": "IPBES Transformative Change Assessment citation page",
-        "url": "https://ict.ipbes.net/ipbes-ict-guide/data-and-knowledge-management/citations-of-ipbes-assessments/transformative-change-assessment",
+        "title": (
+            "IPBES Transformative Change Assessment "
+            "citation page"
+        ),
+        "url": (
+            "https://ict.ipbes.net/ipbes-ict-guide/"
+            "data-and-knowledge-management/"
+            "citations-of-ipbes-assessments/"
+            "transformative-change-assessment"
+        ),
         "source_type": "Approved external IPBES source",
     },
 ]
 
 
 HEADERS = {
-    "User-Agent": "AskBIONEXT2-SourceBuilder/3.0"
+    "User-Agent": "AskBIONEXT2-SourceBuilder/5.0"
 }
 
-
-# Aim to keep each retrieval unit below the amount currently passed
-# from each source into the Ask BIONEXT prompt.
 CHUNK_SIZE = 3000
 CHUNK_OVERLAP = 350
 
+MAX_BIONEXT_PAGES = 500
+
+REQUEST_DELAY = 0.15
+
+
+# -------------------------------------------------------------------
+# HTTP helpers
+# -------------------------------------------------------------------
+
+
+def get_response(url, timeout=30):
+    """
+    Fetch a URL with a short courtesy delay.
+    """
+
+    time.sleep(REQUEST_DELAY)
+
+    response = requests.get(
+        url,
+        headers=HEADERS,
+        timeout=timeout,
+        allow_redirects=True,
+    )
+
+    response.raise_for_status()
+
+    return response
+
+
+# -------------------------------------------------------------------
+# URL helpers
+# -------------------------------------------------------------------
+
+
+def normalise_url(url):
+    """
+    Normalise a URL for comparison and deduplication.
+    """
+
+    url = url.split("#")[0]
+
+    parsed = urlparse(url)
+
+    path = parsed.path
+
+    if path != "/":
+        path = path.rstrip("/")
+
+    return parsed._replace(
+        path=path,
+        fragment="",
+    ).geturl()
+
+
+def is_bionext_url(url):
+    """
+    Return True only for pages within the Oppla BIONEXT area.
+    """
+
+    parsed = urlparse(url)
+
+    if parsed.netloc not in [
+        "oppla.eu",
+        "www.oppla.eu",
+    ]:
+        return False
+
+    return (
+        parsed.path == "/bionext"
+        or parsed.path.startswith("/bionext/")
+    )
+
+
+def looks_like_resource_page(url):
+    """
+    Identify an individual BIONEXT resource page.
+    """
+
+    parsed = urlparse(url)
+
+    return (
+        "/bionext/resource/"
+        in parsed.path.lower()
+    )
+
+
+def looks_like_pdf(url):
+    """
+    Detect a PDF even if query parameters are present.
+    """
+
+    parsed = urlparse(url)
+
+    return (
+        parsed.path.lower().endswith(".pdf")
+    )
+
+
+# -------------------------------------------------------------------
+# Text cleaning
+# -------------------------------------------------------------------
+
 
 def clean_text(text):
-    """Clean extracted webpage or PDF text."""
+    """
+    Clean extracted webpage or PDF text.
+    """
 
     boilerplate = [
         "Skip to main content",
@@ -88,21 +192,39 @@ def clean_text(text):
         "Contact",
     ]
 
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
 
     for phrase in boilerplate:
-        text = text.replace(phrase, " ")
+        text = text.replace(
+            phrase,
+            " ",
+        )
 
-    text = re.sub(r"\s+", " ", text)
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    )
 
     return text.strip()
 
 
-def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+# -------------------------------------------------------------------
+# Chunking
+# -------------------------------------------------------------------
+
+
+def chunk_text(
+    text,
+    chunk_size=CHUNK_SIZE,
+    overlap=CHUNK_OVERLAP,
+):
     """
     Break long text into smaller overlapping chunks.
-
-    Tries to finish chunks at a sentence boundary where possible.
     """
 
     text = clean_text(text)
@@ -114,10 +236,12 @@ def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         return [text]
 
     chunks = []
+
     start = 0
     text_length = len(text)
 
     while start < text_length:
+
         target_end = min(
             start + chunk_size,
             text_length,
@@ -125,9 +249,8 @@ def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 
         end = target_end
 
-        # If this is not the end of the document, try to stop at
-        # a natural sentence boundary.
         if target_end < text_length:
+
             search_start = max(
                 start + int(chunk_size * 0.65),
                 start,
@@ -150,12 +273,10 @@ def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
         if end >= text_length:
             break
 
-        new_start = max(
+        start = max(
             end - overlap,
             start + 1,
         )
-
-        start = new_start
 
     return chunks
 
@@ -166,12 +287,10 @@ def add_chunked_source(
     url,
     source_type,
     text,
+    metadata=None,
 ):
     """
-    Add a document to the output database.
-
-    Short documents remain as one source.
-    Long documents become multiple retrieval chunks.
+    Add a document to the retrieval database.
     """
 
     chunks = chunk_text(text)
@@ -181,18 +300,23 @@ def add_chunked_source(
 
     total_chunks = len(chunks)
 
+    metadata = metadata or {}
+
     for index, chunk in enumerate(
         chunks,
         start=1,
     ):
+
         if total_chunks == 1:
             chunk_title = title
+
         else:
             chunk_title = (
-                f"{title} — section {index} of {total_chunks}"
+                f"{title} — section "
+                f"{index} of {total_chunks}"
             )
 
-        output.append({
+        record = {
             "title": chunk_title,
             "parent_title": title,
             "url": url,
@@ -200,24 +324,35 @@ def add_chunked_source(
             "chunk_number": index,
             "chunk_count": total_chunks,
             "text": chunk,
-        })
+        }
+
+        record.update(metadata)
+
+        output.append(record)
 
     return total_chunks
 
 
+# -------------------------------------------------------------------
+# Web extraction
+# -------------------------------------------------------------------
+
+
 def extract_page(url):
     """
-    Download an approved webpage and extract readable text.
-    Returns None if extraction fails.
+    Download a webpage and extract readable text.
     """
 
     try:
-        response = requests.get(
+
+        response = get_response(
             url,
-            headers=HEADERS,
             timeout=30,
         )
-        response.raise_for_status()
+
+        final_url = normalise_url(
+            response.url
+        )
 
         soup = BeautifulSoup(
             response.text,
@@ -236,13 +371,19 @@ def extract_page(url):
             tag.decompose()
 
         title = (
-            soup.title.get_text(" ", strip=True)
+            soup.title.get_text(
+                " ",
+                strip=True,
+            )
             if soup.title
-            else url
+            else final_url
         )
 
         text = clean_text(
-            soup.get_text(" ", strip=True)
+            soup.get_text(
+                " ",
+                strip=True,
+            )
         )
 
         if len(text) < 100:
@@ -250,31 +391,38 @@ def extract_page(url):
 
         return {
             "title": title,
-            "url": url,
+            "url": final_url,
             "text": text,
         }
 
     except Exception as exc:
+
         print(
-            f"Could not extract webpage {url}: {exc}"
+            f"Could not extract webpage "
+            f"{url}: {exc}"
         )
+
         return None
 
 
-def get_pdf_links(url):
+# -------------------------------------------------------------------
+# Link extraction
+# -------------------------------------------------------------------
+
+
+def get_links_from_page(url):
     """
-    Find PDF documents linked from a webpage.
+    Return links found on a webpage.
     """
 
-    pdf_links = set()
+    links = set()
 
     try:
-        response = requests.get(
+
+        response = get_response(
             url,
-            headers=HEADERS,
             timeout=30,
         )
-        response.raise_for_status()
 
         soup = BeautifulSoup(
             response.text,
@@ -285,57 +433,299 @@ def get_pdf_links(url):
             "a",
             href=True,
         ):
+
             absolute_url = urljoin(
-                url,
+                response.url,
                 link["href"],
             )
 
-            clean_url = absolute_url.split("#")[0]
-
-            parsed = urlparse(clean_url)
-
-            if parsed.path.lower().endswith(".pdf"):
-                pdf_links.add(clean_url)
+            links.add(
+                normalise_url(
+                    absolute_url
+                )
+            )
 
     except Exception as exc:
+
         print(
-            f"Could not inspect PDFs on {url}: {exc}"
+            f"Could not inspect links on "
+            f"{url}: {exc}"
         )
 
-    return sorted(pdf_links)
+    return sorted(links)
+
+
+# -------------------------------------------------------------------
+# Recursive BIONEXT crawl
+# -------------------------------------------------------------------
+
+
+def crawl_bionext_site():
+    """
+    Recursively discover public pages within /bionext.
+    """
+
+    queue = [
+        normalise_url(url)
+        for url in START_PAGES
+    ]
+
+    visited = set()
+    discovered = set()
+
+    while queue:
+
+        if (
+            len(visited)
+            >= MAX_BIONEXT_PAGES
+        ):
+
+            print(
+                "BIONEXT page safety "
+                "limit reached."
+            )
+
+            break
+
+        current_url = queue.pop(0)
+
+        if current_url in visited:
+            continue
+
+        if not is_bionext_url(
+            current_url
+        ):
+            continue
+
+        visited.add(current_url)
+        discovered.add(current_url)
+
+        print(
+            f"Discovering links: "
+            f"{current_url}"
+        )
+
+        for link in get_links_from_page(
+            current_url
+        ):
+
+            if not is_bionext_url(link):
+                continue
+
+            if looks_like_pdf(link):
+                continue
+
+            if link not in visited:
+                queue.append(link)
+
+    return sorted(discovered)
+
+
+# -------------------------------------------------------------------
+# Authoritative BIONEXT resource API
+# -------------------------------------------------------------------
+
+
+def get_bionext_api_resources():
+    """
+    Retrieve the complete current BIONEXT resource collection
+    from the Oppla resource API.
+    """
+
+    print(
+        "Reading BIONEXT resource API..."
+    )
+
+    try:
+
+        response = get_response(
+            BIONEXT_RESOURCE_API,
+            timeout=30,
+        )
+
+        data = response.json()
+
+        resources = data.get(
+            "resources",
+            [],
+        )
+
+        print(
+            f"{len(resources)} resource "
+            "record(s) returned by API"
+        )
+
+        return resources
+
+    except Exception as exc:
+
+        print(
+            "Could not read BIONEXT "
+            f"resource API: {exc}"
+        )
+
+        return []
+
+
+def resolve_resource_page(resource):
+    """
+    Resolve an API resource nid to its canonical public
+    BIONEXT resource URL.
+
+    Drupal /node/{nid} redirects to the public alias.
+    """
+
+    nid = resource.get("nid")
+
+    if not nid:
+        return None
+
+    node_url = (
+        NODE_BASE
+        + str(nid)
+    )
+
+    try:
+
+        response = get_response(
+            node_url,
+            timeout=30,
+        )
+
+        final_url = normalise_url(
+            response.url
+        )
+
+        if not is_bionext_url(
+            final_url
+        ):
+            return None
+
+        return final_url
+
+    except Exception as exc:
+
+        print(
+            f"Could not resolve resource "
+            f"{nid}: {exc}"
+        )
+
+        return None
+
+
+def discover_api_resource_pages():
+    """
+    Return canonical resource pages plus API metadata.
+    """
+
+    api_resources = (
+        get_bionext_api_resources()
+    )
+
+    discovered = []
+
+    seen_urls = set()
+
+    for resource in api_resources:
+
+        nid = resource.get("nid")
+
+        title = resource.get(
+            "title",
+            "",
+        )
+
+        print(
+            f"Resolving API resource "
+            f"{nid}: {title}"
+        )
+
+        url = resolve_resource_page(
+            resource
+        )
+
+        if not url:
+            continue
+
+        if url in seen_urls:
+            continue
+
+        seen_urls.add(url)
+
+        discovered.append({
+            "url": url,
+            "nid": nid,
+            "api_title": title,
+            "teaser_text": resource.get(
+                "teaser_text",
+                "",
+            ),
+            "publication_date": (
+                resource.get(
+                    "publication_date",
+                    "",
+                )
+            ),
+            "keywords": resource.get(
+                "keywords",
+                [],
+            ),
+            "resource_type_ids": (
+                resource.get(
+                    "resource_type",
+                    [],
+                )
+            ),
+        })
+
+    return discovered
+
+
+# -------------------------------------------------------------------
+# PDF extraction
+# -------------------------------------------------------------------
 
 
 def pdf_title_from_url(url):
     """
-    Create a readable title from the PDF filename.
+    Create a readable title from a PDF filename.
     """
 
     filename = unquote(
-        urlparse(url).path.split("/")[-1]
+        urlparse(url)
+        .path
+        .split("/")[-1]
     )
 
-    if filename.lower().endswith(".pdf"):
+    if filename.lower().endswith(
+        ".pdf"
+    ):
         filename = filename[:-4]
 
-    filename = filename.replace("_", " ")
-    filename = filename.replace("-", " ")
+    filename = filename.replace(
+        "_",
+        " ",
+    )
+
+    filename = filename.replace(
+        "-",
+        " ",
+    )
 
     return filename.strip()
 
 
 def extract_pdf(url):
     """
-    Download a PDF and extract its text using pypdf.
-    Returns None if extraction fails.
+    Download a PDF and extract text using pypdf.
     """
 
     try:
-        response = requests.get(
+
+        response = get_response(
             url,
-            headers=HEADERS,
             timeout=60,
         )
-        response.raise_for_status()
 
         pdf_file = io.BytesIO(
             response.content
@@ -351,7 +741,9 @@ def extract_pdf(url):
             reader.pages,
             start=1,
         ):
+
             try:
+
                 page_text = (
                     page.extract_text()
                     or ""
@@ -362,14 +754,18 @@ def extract_pdf(url):
                 )
 
                 if page_text:
+
                     pages.append(
-                        f"[Page {page_number}] {page_text}"
+                        f"[Page {page_number}] "
+                        f"{page_text}"
                     )
 
             except Exception as exc:
+
                 print(
                     f"Could not read page "
-                    f"{page_number} of {url}: {exc}"
+                    f"{page_number} of "
+                    f"{url}: {exc}"
                 )
 
         text = clean_text(
@@ -377,87 +773,40 @@ def extract_pdf(url):
         )
 
         if len(text) < 100:
+
             print(
                 "PDF contained too little "
                 f"extractable text: {url}"
             )
+
             return None
 
         return {
-            "title": pdf_title_from_url(url),
+            "title": pdf_title_from_url(
+                url
+            ),
             "url": url,
             "text": text,
         }
 
     except Exception as exc:
+
         print(
-            f"Could not extract PDF {url}: {exc}"
+            f"Could not extract PDF "
+            f"{url}: {exc}"
         )
+
         return None
 
 
-def get_bionext_links(url):
-    """
-    Find links on an approved BIONEXT page that remain within
-    the Oppla BIONEXT area.
-    """
-
-    links = set()
-
-    try:
-        response = requests.get(
-            url,
-            headers=HEADERS,
-            timeout=30,
-        )
-        response.raise_for_status()
-
-        soup = BeautifulSoup(
-            response.text,
-            "html.parser",
-        )
-
-        for link in soup.find_all(
-            "a",
-            href=True,
-        ):
-            absolute_url = urljoin(
-                url,
-                link["href"],
-            )
-
-            parsed = urlparse(
-                absolute_url
-            )
-
-            if parsed.netloc not in [
-                "oppla.eu",
-                "www.oppla.eu",
-            ]:
-                continue
-
-            if "/bionext" not in parsed.path.lower():
-                continue
-
-            clean_url = (
-                absolute_url
-                .split("#")[0]
-            )
-
-            links.add(clean_url)
-
-    except Exception as exc:
-        print(
-            "Could not inspect BIONEXT links "
-            f"on {url}: {exc}"
-        )
-
-    return sorted(links)
+# -------------------------------------------------------------------
+# Deduplication
+# -------------------------------------------------------------------
 
 
 def text_fingerprint(text):
     """
-    Create a fingerprint used to identify duplicate documents.
+    Create a fingerprint for duplicate detection.
     """
 
     normalised = re.sub(
@@ -467,136 +816,221 @@ def text_fingerprint(text):
     ).strip()
 
     return hashlib.sha256(
-        normalised.encode("utf-8")
+        normalised.encode(
+            "utf-8"
+        )
     ).hexdigest()
 
 
+# -------------------------------------------------------------------
+# Build database
+# -------------------------------------------------------------------
+
+
 def build_sources():
-    """Create the Ask BIONEXT source database."""
+    """
+    Create the Ask BIONEXT source database.
+    """
 
     raw_documents = []
-    seen_urls = set()
-    seen_content = set()
+
+    seen_page_urls = set()
+    seen_pdf_content = set()
 
     print()
-    print("=====================================")
-    print("Building Ask BIONEXT 2.0 source database")
-    print("=====================================")
-    print()
-
-    # ---------------------------------------------------------------
-    # 1. Approved starting pages
-    # ---------------------------------------------------------------
-
-    print("Reading approved BIONEXT pages...")
-    print()
-
-    for source in START_PAGES:
-        print(
-            f"Reading: {source['url']}"
-        )
-
-        extracted = extract_page(
-            source["url"]
-        )
-
-        if extracted:
-            raw_documents.append({
-                "title": source["title"],
-                "url": source["url"],
-                "source_type": source["source_type"],
-                "text": extracted["text"],
-            })
-
-            seen_urls.add(
-                source["url"]
-            )
-
-    # ---------------------------------------------------------------
-    # 2. Discover linked BIONEXT pages
-    # ---------------------------------------------------------------
-
-    print()
-    print("Discovering linked BIONEXT pages...")
-
-    discovered_links = get_bionext_links(
-        "https://oppla.eu/bionext"
+    print(
+        "====================================="
     )
+    print(
+        "Building Ask BIONEXT 2.0 "
+        "source database"
+    )
+    print(
+        "====================================="
+    )
+    print()
+
+    # ---------------------------------------------------------------
+    # 1. Recursively discover BIONEXT pages
+    # ---------------------------------------------------------------
 
     print(
-        f"Found {len(discovered_links)} linked BIONEXT pages"
+        "Recursively discovering "
+        "BIONEXT pages..."
+    )
+    print()
+
+    bionext_pages = set(
+        crawl_bionext_site()
+    )
+
+    print()
+    print(
+        f"{len(bionext_pages)} "
+        "BIONEXT pages discovered "
+        "by site crawl"
     )
 
     # ---------------------------------------------------------------
-    # 3. Discover linked PDFs
+    # 2. Retrieve authoritative resource collection
     # ---------------------------------------------------------------
 
     print()
-    print("Discovering linked PDF documents...")
+    print(
+        "Discovering BIONEXT resources "
+        "from API..."
+    )
+    print()
+
+    api_resource_pages = (
+        discover_api_resource_pages()
+    )
+
+    print()
+    print(
+        f"{len(api_resource_pages)} "
+        "BIONEXT resource page(s) "
+        "resolved from API"
+    )
+
+    resource_metadata = {}
+
+    for item in api_resource_pages:
+
+        url = item["url"]
+
+        bionext_pages.add(url)
+
+        resource_metadata[url] = item
+
+    # ---------------------------------------------------------------
+    # 3. Extract BIONEXT webpages
+    # ---------------------------------------------------------------
+
+    print()
+    print(
+        "Extracting BIONEXT webpages..."
+    )
+    print()
 
     pdf_links = set()
 
-    pages_to_check_for_pdfs = (
-        [source["url"] for source in START_PAGES]
-        + discovered_links
-    )
+    for url in sorted(
+        bionext_pages
+    ):
 
-    for url in pages_to_check_for_pdfs:
-        discovered_pdfs = get_pdf_links(
-            url
-        )
-
-        for pdf_url in discovered_pdfs:
-            pdf_links.add(pdf_url)
-
-    print(
-        f"Found {len(pdf_links)} PDF links"
-    )
-
-    # ---------------------------------------------------------------
-    # 4. Extract linked BIONEXT pages
-    # ---------------------------------------------------------------
-
-    print()
-    print("Reading linked BIONEXT pages...")
-    print()
-
-    for url in discovered_links:
-        if url in seen_urls:
+        if url in seen_page_urls:
             continue
 
         print(
-            f"Reading linked page: {url}"
+            f"Reading webpage: {url}"
         )
 
         extracted = extract_page(
             url
         )
 
-        if not extracted:
-            continue
+        if extracted:
 
-        raw_documents.append({
-            "title": extracted["title"],
-            "url": url,
-            "source_type": "Linked Oppla BIONEXT page",
-            "text": extracted["text"],
-        })
+            final_url = extracted["url"]
 
-        seen_urls.add(url)
+            if final_url in seen_page_urls:
+                continue
+
+            metadata = (
+                resource_metadata.get(
+                    final_url,
+                    {}
+                )
+            )
+
+            if looks_like_resource_page(
+                final_url
+            ):
+
+                source_type = (
+                    "BIONEXT resource page"
+                )
+
+            elif (
+                "decision-analysis"
+                in final_url.lower()
+                or "decision-making"
+                in final_url.lower()
+            ):
+
+                source_type = (
+                    "Oppla BIONEXT "
+                    "decision-analysis page"
+                )
+
+            elif (
+                "/article/"
+                in final_url.lower()
+            ):
+
+                source_type = (
+                    "BIONEXT article"
+                )
+
+            else:
+
+                source_type = (
+                    "Oppla BIONEXT page"
+                )
+
+            raw_documents.append({
+                "title": extracted["title"],
+                "url": final_url,
+                "source_type": source_type,
+                "text": extracted["text"],
+                "metadata": {
+                    "resource_nid": (
+                        metadata.get("nid")
+                    ),
+                    "publication_date": (
+                        metadata.get(
+                            "publication_date",
+                            "",
+                        )
+                    ),
+                },
+            })
+
+            seen_page_urls.add(
+                final_url
+            )
+
+        # Discover PDFs linked from this page.
+        for link in get_links_from_page(
+            url
+        ):
+
+            if looks_like_pdf(
+                link
+            ):
+
+                pdf_links.add(
+                    link
+                )
 
     # ---------------------------------------------------------------
-    # 5. Extract and deduplicate PDFs
+    # 4. Extract linked PDFs
     # ---------------------------------------------------------------
 
     print()
-    print("Reading linked PDF documents...")
+    print(
+        "Reading linked PDFs..."
+    )
     print()
 
     pdfs_extracted = 0
     pdfs_deduplicated = 0
 
-    for pdf_url in sorted(pdf_links):
+    for pdf_url in sorted(
+        pdf_links
+    ):
+
         print(
             f"Reading PDF: {pdf_url}"
         )
@@ -612,15 +1046,18 @@ def build_sources():
             extracted["text"]
         )
 
-        if fingerprint in seen_content:
+        if fingerprint in seen_pdf_content:
+
             print(
                 "Duplicate PDF skipped: "
                 f"{pdf_url}"
             )
+
             pdfs_deduplicated += 1
+
             continue
 
-        seen_content.add(
+        seen_pdf_content.add(
             fingerprint
         )
 
@@ -629,19 +1066,24 @@ def build_sources():
             "url": pdf_url,
             "source_type": "BIONEXT PDF",
             "text": extracted["text"],
+            "metadata": {},
         })
 
         pdfs_extracted += 1
 
     # ---------------------------------------------------------------
-    # 6. Approved external sources
+    # 5. Approved external sources
     # ---------------------------------------------------------------
 
     print()
-    print("Reading approved external sources...")
+    print(
+        "Reading approved external "
+        "sources..."
+    )
     print()
 
     for source in EXTERNAL_SOURCES:
+
         print(
             f"Reading: {source['url']}"
         )
@@ -650,31 +1092,47 @@ def build_sources():
             source["url"]
         )
 
-        if extracted:
-            raw_documents.append({
-                "title": source["title"],
-                "url": source["url"],
-                "source_type": source["source_type"],
-                "text": extracted["text"],
-            })
+        if not extracted:
+            continue
+
+        raw_documents.append({
+            "title": source["title"],
+            "url": source["url"],
+            "source_type": (
+                source["source_type"]
+            ),
+            "text": extracted["text"],
+            "metadata": {},
+        })
 
     # ---------------------------------------------------------------
-    # 7. Chunk documents for retrieval
+    # 6. Chunk for retrieval
     # ---------------------------------------------------------------
 
     print()
-    print("Creating retrieval chunks...")
+    print(
+        "Creating retrieval chunks..."
+    )
     print()
 
     sources = []
 
     for document in raw_documents:
+
         count = add_chunked_source(
             output=sources,
             title=document["title"],
             url=document["url"],
-            source_type=document["source_type"],
+            source_type=(
+                document["source_type"]
+            ),
             text=document["text"],
+            metadata=(
+                document.get(
+                    "metadata",
+                    {}
+                )
+            ),
         )
 
         print(
@@ -683,7 +1141,7 @@ def build_sources():
         )
 
     # ---------------------------------------------------------------
-    # 8. Save sources.json
+    # 7. Save
     # ---------------------------------------------------------------
 
     with open(
@@ -691,6 +1149,7 @@ def build_sources():
         "w",
         encoding="utf-8",
     ) as file:
+
         json.dump(
             sources,
             file,
@@ -699,24 +1158,52 @@ def build_sources():
         )
 
     print()
-    print("=====================================")
-    print("Ask BIONEXT source database complete")
-    print("=====================================")
+    print(
+        "====================================="
+    )
+    print(
+        "Ask BIONEXT source database complete"
+    )
+    print(
+        "====================================="
+    )
     print()
+
     print(
-        f"{len(raw_documents)} unique documents collected"
+        f"{len(bionext_pages)} "
+        "total BIONEXT webpages known"
     )
+
     print(
-        f"{len(sources)} retrieval chunks saved to sources.json"
+        f"{len(api_resource_pages)} "
+        "BIONEXT resources obtained "
+        "from API"
     )
+
     print(
-        f"{len(pdf_links)} PDF links discovered"
+        f"{len(pdf_links)} "
+        "PDF links discovered"
     )
+
     print(
-        f"{pdfs_extracted} unique PDFs extracted"
+        f"{pdfs_extracted} "
+        "unique PDFs extracted"
     )
+
     print(
-        f"{pdfs_deduplicated} duplicate PDFs skipped"
+        f"{pdfs_deduplicated} "
+        "duplicate PDFs skipped"
+    )
+
+    print(
+        f"{len(raw_documents)} "
+        "documents collected"
+    )
+
+    print(
+        f"{len(sources)} "
+        "retrieval chunks saved "
+        "to sources.json"
     )
 
 
