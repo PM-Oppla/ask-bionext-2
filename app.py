@@ -11,7 +11,7 @@ from openai import OpenAI
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v13
+# App v14
 #
 # Focus of this version:
 # - source-bounded answers
@@ -23,6 +23,7 @@ from openai import OpenAI
 # - source-type filtering
 # - grouped citations
 # - streamed answer generation
+# - limited session-based conversational memory
 # - two-stage evidence gate for weak / unsupported questions
 #
 # Interface styling is based on the supplied BIONEXT logo, website,
@@ -298,6 +299,13 @@ st.markdown(
 EMBEDDING_MODEL = "text-embedding-3-small"
 ANSWER_MODEL = "gpt-4o-mini"
 ANSWERABILITY_MODEL = "gpt-4o-mini"
+CONVERSATION_MODEL = "gpt-4o-mini"
+
+# Conversation memory is intentionally limited. Previous turns are used only
+# to resolve follow-up references and maintain continuity; they are never
+# treated as evidence.
+MAX_MEMORY_TURNS = 4
+MAX_MEMORY_ANSWER_CHARS = 2500
 
 # The OpenAI embeddings endpoint has a per-request token limit.
 # The knowledge base is now large enough that embedding every chunk in one
@@ -1069,6 +1077,124 @@ def make_context(groups):
 
 
 # -------------------------------------------------------------------
+# Limited conversational memory
+# -------------------------------------------------------------------
+
+
+def get_recent_conversation(history):
+    """
+    Return only the most recent conversation turns.
+
+    Memory is session-based and deliberately short-lived. It is used to
+    interpret follow-up questions, not as an evidence source.
+    """
+
+    if not history:
+        return []
+
+    return history[-MAX_MEMORY_TURNS:]
+
+
+def format_conversation_context(history):
+    """
+    Create a compact conversation summary for reference resolution.
+    """
+
+    recent = get_recent_conversation(history)
+
+    if not recent:
+        return ""
+
+    parts = []
+
+    for index, turn in enumerate(
+        recent,
+        start=1,
+    ):
+        answer = (
+            turn.get("answer", "")
+            [:MAX_MEMORY_ANSWER_CHARS]
+        )
+
+        parts.append(
+            f"Turn {index}\n"
+            f"User: {turn.get('question', '')}\n"
+            f"Assistant: {answer}"
+        )
+
+    return "\n\n".join(parts)
+
+
+def resolve_followup_question(
+    question,
+    history,
+):
+    """
+    Convert a follow-up question into a standalone retrieval query.
+
+    The model may use prior conversation only to resolve references such as
+    'that', 'it', 'those findings' or 'the policy implications'. It is
+    explicitly forbidden from adding new facts.
+    """
+
+    recent = get_recent_conversation(
+        history
+    )
+
+    if not recent:
+        return question
+
+    conversation_context = (
+        format_conversation_context(
+            recent
+        )
+    )
+
+    prompt = f"""
+You are a query-rewriting component for Ask BIONEXT.
+
+Rewrite the CURRENT QUESTION as a concise, standalone search question using
+the previous conversation only to resolve references and omitted context.
+
+Rules:
+- Do not answer the question.
+- Do not add facts or assumptions.
+- Do not introduce information that is absent from the conversation.
+- Preserve the user's intent.
+- If the current question is already standalone, return it unchanged.
+- Return only the rewritten question.
+
+Previous conversation:
+{conversation_context}
+
+CURRENT QUESTION:
+{question}
+"""
+
+    response = client.chat.completions.create(
+        model=CONVERSATION_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        temperature=0,
+        max_tokens=140,
+    )
+
+    rewritten = (
+        response
+        .choices[0]
+        .message
+        .content
+        .strip()
+    )
+
+    return rewritten or question
+
+
+# -------------------------------------------------------------------
 # Evidence answerability check
 # -------------------------------------------------------------------
 
@@ -1179,11 +1305,24 @@ def stream_answer(prompt):
 def generate_answer(
     question,
     allowed_source_types,
+    conversation_history=None,
 ):
+    conversation_history = (
+        conversation_history
+        or []
+    )
+
+    retrieval_question = (
+        resolve_followup_question(
+            question,
+            conversation_history,
+        )
+    )
+
     sources = load_sources()
 
     retrieved, route = retrieve_sources(
-        question,
+        retrieval_question,
         sources,
         allowed_source_types,
     )
@@ -1216,7 +1355,7 @@ def generate_answer(
     )
 
     if not evidence_supports_question(
-        question,
+        retrieval_question,
         groups,
     ):
         return (
@@ -1229,6 +1368,12 @@ def generate_answer(
 
     context = make_context(
         groups
+    )
+
+    conversation_context = (
+        format_conversation_context(
+            conversation_history
+        )
     )
 
     prompt = f"""
@@ -1280,9 +1425,26 @@ Citations:
 20. Do not create a bibliography or a separate "Sources used" section in
     the answer; the application displays the source list automatically.
 
-User question:
+Conversation policy:
+
+21. The previous conversation below may be used only to understand what the
+    user is referring to and to maintain continuity.
+22. Previous assistant answers are NOT evidence. Every factual claim in the
+    current answer must still be supported by the approved source material.
+23. For a follow-up question, answer the user's current request rather than
+    unnecessarily repeating the previous answer.
+
+Previous conversation (context only; not evidence):
+
+{conversation_context if conversation_context else "No previous conversation."}
+
+User's current question:
 
 {question}
+
+Standalone interpretation used for retrieval:
+
+{retrieval_question}
 
 Approved source material:
 
@@ -1308,6 +1470,66 @@ Approved source material:
 
 def set_example_question(example):
     st.session_state["question_input"] = example
+
+
+def clear_conversation():
+    st.session_state["conversation_history"] = []
+    st.session_state["question_input"] = ""
+
+
+def render_source_cards(groups):
+    for number, group in enumerate(
+        groups,
+        start=1,
+    ):
+        st.markdown(
+            f"""
+            <div class="source-card">
+              <span class="source-num">[{number}]</span>
+              <a href="{group['url']}" target="_blank">
+                <strong>{group['title']}</strong>
+              </a>
+              <div class="source-type">{group['source_type']}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_conversation_history(history):
+    if not history:
+        return
+
+    st.markdown("### Conversation")
+
+    for turn in history:
+        st.markdown(
+            f"**You:** {turn.get('question', '')}"
+        )
+
+        with st.container(
+            border=True,
+        ):
+            st.markdown(
+                turn.get(
+                    "answer",
+                    "",
+                )
+            )
+
+        groups = turn.get(
+            "groups",
+            [],
+        )
+
+        if groups:
+            with st.expander(
+                "Sources used for this answer",
+                expanded=False,
+            ):
+                render_source_cards(
+                    groups
+                )
 
 
 def render_brand_header():
@@ -1354,6 +1576,9 @@ def render_partner_footer():
 
 
 render_brand_header()
+
+if "conversation_history" not in st.session_state:
+    st.session_state["conversation_history"] = []
 
 sources = load_sources()
 
@@ -1428,6 +1653,14 @@ with st.sidebar:
             "Deselect a source type to exclude it."
         )
 
+    if st.session_state["conversation_history"]:
+        st.button(
+            "Clear conversation",
+            key="clear_conversation_button",
+            use_container_width=True,
+            on_click=clear_conversation,
+        )
+
     st.caption(
         "Ask BIONEXT answers only from the approved evidence base. "
         "Unsupported questions are not answered from general knowledge."
@@ -1457,29 +1690,40 @@ st.markdown(
 )
 
 
-st.markdown(
-    '<div class="example-label">Try an example</div>',
-    unsafe_allow_html=True,
+render_conversation_history(
+    st.session_state[
+        "conversation_history"
+    ]
 )
 
-example_questions = [
-    "What are the main objectives of the BIONEXT project?",
-    "What does BIONEXT say about justice in biodiversity policy?",
-    "How does BIONEXT use decision analysis to support environmental decision-making?",
-    "What is transformative change according to the IPBES Transformative Change Assessment?",
-]
+if not st.session_state[
+    "conversation_history"
+]:
+    st.markdown(
+        '<div class="example-label">Try an example</div>',
+        unsafe_allow_html=True,
+    )
 
-example_cols = st.columns(2)
+    example_questions = [
+        "What are the main objectives of the BIONEXT project?",
+        "What does BIONEXT say about justice in biodiversity policy?",
+        "How does BIONEXT use decision analysis to support environmental decision-making?",
+        "What is transformative change according to the IPBES Transformative Change Assessment?",
+    ]
 
-for index, example in enumerate(example_questions):
-    with example_cols[index % 2]:
-        st.button(
-            example,
-            key=f"example_{index}",
-            use_container_width=True,
-            on_click=set_example_question,
-            args=(example,),
-        )
+    example_cols = st.columns(2)
+
+    for index, example in enumerate(
+        example_questions
+    ):
+        with example_cols[index % 2]:
+            st.button(
+                example,
+                key=f"example_{index}",
+                use_container_width=True,
+                on_click=set_example_question,
+                args=(example,),
+            )
 
 
 question = st.text_input(
@@ -1522,6 +1766,9 @@ if (
                 ) = generate_answer(
                     question,
                     selected_source_types,
+                    st.session_state[
+                        "conversation_history"
+                    ],
                 )
 
                 unsupported = (
@@ -1535,7 +1782,10 @@ if (
                 )
 
                 if unsupported:
-                    st.info(answer)
+                    final_answer = answer
+                    st.info(
+                        final_answer
+                    )
                 else:
                     with st.container(
                         border=True,
@@ -1554,27 +1804,32 @@ if (
                             streamed_answer
                         )
 
+                    final_answer = streamed_answer
+
                 if groups:
                     st.markdown(
                         "### Sources used"
                     )
 
-                    for number, group in enumerate(
-                        groups,
-                        start=1,
-                    ):
-                        st.markdown(
-                            f"""
-                            <div class="source-card">
-                              <span class="source-num">[{number}]</span>
-                              <a href="{group['url']}" target="_blank">
-                                <strong>{group['title']}</strong>
-                              </a>
-                              <div class="source-type">{group['source_type']}</div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
+                    render_source_cards(
+                        groups
+                    )
+
+                st.session_state[
+                    "conversation_history"
+                ].append(
+                    {
+                        "question": question,
+                        "answer": final_answer,
+                        "groups": groups,
+                    }
+                )
+
+                st.session_state[
+                    "conversation_history"
+                ] = st.session_state[
+                    "conversation_history"
+                ][-MAX_MEMORY_TURNS:]
 
                 if show_technical_details:
                     with st.expander(
