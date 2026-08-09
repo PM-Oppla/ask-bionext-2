@@ -11,7 +11,7 @@ from openai import OpenAI
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v12
+# App v13
 #
 # Focus of this version:
 # - source-bounded answers
@@ -22,6 +22,7 @@ from openai import OpenAI
 # - route-aware source weighting
 # - source-type filtering
 # - grouped citations
+# - streamed answer generation
 # - two-stage evidence gate for weak / unsupported questions
 #
 # Interface styling is based on the supplied BIONEXT logo, website,
@@ -1142,6 +1143,39 @@ Evidence:
 # -------------------------------------------------------------------
 
 
+def stream_answer(prompt):
+    """
+    Stream an answer from the OpenAI API.
+
+    Retrieval, evidence gating, source grouping and citations are completed
+    before this function is called. Only the final answer-generation step is
+    streamed to the Streamlit interface.
+    """
+
+    response_stream = client.chat.completions.create(
+        model=ANSWER_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        temperature=0.15,
+        max_tokens=1400,
+        stream=True,
+    )
+
+    for chunk in response_stream:
+        if not chunk.choices:
+            continue
+
+        delta = chunk.choices[0].delta
+        content = getattr(delta, "content", None)
+
+        if content:
+            yield content
+
+
 def generate_answer(
     question,
     allowed_source_types,
@@ -1255,27 +1289,12 @@ Approved source material:
 {context}
 """
 
-    response = client.chat.completions.create(
-        model=ANSWER_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        temperature=0.15,
-        max_tokens=1400,
-    )
-
-    answer = (
-        response
-        .choices[0]
-        .message
-        .content
+    answer_stream = stream_answer(
+        prompt
     )
 
     return (
-        answer,
+        answer_stream,
         route,
         groups,
         retrieved,
@@ -1505,8 +1524,14 @@ if (
                     selected_source_types,
                 )
 
-                unsupported = answer.startswith(
-                    "I could not find sufficient evidence"
+                unsupported = (
+                    isinstance(
+                        answer,
+                        str,
+                    )
+                    and answer.startswith(
+                        "I could not find"
+                    )
                 )
 
                 if unsupported:
@@ -1515,7 +1540,19 @@ if (
                     with st.container(
                         border=True,
                     ):
-                        st.markdown(answer)
+                        answer_placeholder = st.empty()
+                        streamed_answer = ""
+
+                        for answer_chunk in answer:
+                            streamed_answer += answer_chunk
+
+                            answer_placeholder.markdown(
+                                streamed_answer + " ▌"
+                            )
+
+                        answer_placeholder.markdown(
+                            streamed_answer
+                        )
 
                 if groups:
                     st.markdown(
