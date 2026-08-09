@@ -13,16 +13,24 @@ from urllib.parse import urljoin, urlparse, unquote
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# Source Builder v5
+# Source Builder v8
 #
 # Sources:
 # - recursively discovered pages within /bionext
 # - authoritative BIONEXT resource API (group 202)
 # - individual BIONEXT resource pages
 # - PDFs linked from BIONEXT pages/resources
+# - IPBES Transformative Change Assessment citation page
+# - Zenodo assessment records discovered from IPBES DOI links
+# - public PDFs associated with those Zenodo records
 # - selected approved external sources
 #
 # Long documents are chunked for semantic retrieval.
+# -------------------------------------------------------------------
+
+
+# -------------------------------------------------------------------
+# BIONEXT configuration
 # -------------------------------------------------------------------
 
 
@@ -47,31 +55,40 @@ START_PAGES = [
 ]
 
 
+# -------------------------------------------------------------------
+# IPBES configuration
+# -------------------------------------------------------------------
+
+
+IPBES_TRANSFORMATIVE_ROOT = (
+    "https://ict.ipbes.net/"
+    "ipbes-ict-guide/"
+    "data-and-knowledge-management/"
+    "citations-of-ipbes-assessments/"
+    "transformative-change-assessment"
+)
+
+ZENODO_API_BASE = "https://zenodo.org/api/records/"
+
+
+# -------------------------------------------------------------------
+# Other approved external sources
+# -------------------------------------------------------------------
+
+
 EXTERNAL_SOURCES = [
     {
         "title": "CORDIS BIONEXT project page",
         "url": "https://cordis.europa.eu/project/id/101059662",
         "source_type": "Approved external source",
     },
-    {
-        "title": (
-            "IPBES Transformative Change Assessment "
-            "citation page"
-        ),
-        "url": (
-            "https://ict.ipbes.net/ipbes-ict-guide/"
-            "data-and-knowledge-management/"
-            "citations-of-ipbes-assessments/"
-            "transformative-change-assessment"
-        ),
-        "source_type": "Approved external IPBES source",
-    },
 ]
 
 
 HEADERS = {
-    "User-Agent": "AskBIONEXT2-SourceBuilder/5.0"
+    "User-Agent": "AskBIONEXT2-SourceBuilder/8.0"
 }
+
 
 CHUNK_SIZE = 3000
 CHUNK_OVERLAP = 350
@@ -265,7 +282,9 @@ def chunk_text(
             if candidate != -1:
                 end = candidate + 1
 
-        chunk = text[start:end].strip()
+        chunk = text[
+            start:end
+        ].strip()
 
         if chunk:
             chunks.append(chunk)
@@ -497,8 +516,13 @@ def crawl_bionext_site():
         ):
             continue
 
-        visited.add(current_url)
-        discovered.add(current_url)
+        visited.add(
+            current_url
+        )
+
+        discovered.add(
+            current_url
+        )
 
         print(
             f"Discovering links: "
@@ -509,16 +533,24 @@ def crawl_bionext_site():
             current_url
         ):
 
-            if not is_bionext_url(link):
+            if not is_bionext_url(
+                link
+            ):
                 continue
 
-            if looks_like_pdf(link):
+            if looks_like_pdf(
+                link
+            ):
                 continue
 
             if link not in visited:
-                queue.append(link)
+                queue.append(
+                    link
+                )
 
-    return sorted(discovered)
+    return sorted(
+        discovered
+    )
 
 
 # -------------------------------------------------------------------
@@ -571,11 +603,11 @@ def resolve_resource_page(resource):
     """
     Resolve an API resource nid to its canonical public
     BIONEXT resource URL.
-
-    Drupal /node/{nid} redirects to the public alias.
     """
 
-    nid = resource.get("nid")
+    nid = resource.get(
+        "nid"
+    )
 
     if not nid:
         return None
@@ -599,6 +631,7 @@ def resolve_resource_page(resource):
         if not is_bionext_url(
             final_url
         ):
+
             return None
 
         return final_url
@@ -615,7 +648,7 @@ def resolve_resource_page(resource):
 
 def discover_api_resource_pages():
     """
-    Return canonical resource pages plus API metadata.
+    Return canonical BIONEXT resource pages plus API metadata.
     """
 
     api_resources = (
@@ -628,7 +661,9 @@ def discover_api_resource_pages():
 
     for resource in api_resources:
 
-        nid = resource.get("nid")
+        nid = resource.get(
+            "nid"
+        )
 
         title = resource.get(
             "title",
@@ -650,7 +685,9 @@ def discover_api_resource_pages():
         if url in seen_urls:
             continue
 
-        seen_urls.add(url)
+        seen_urls.add(
+            url
+        )
 
         discovered.append({
             "url": url,
@@ -682,6 +719,329 @@ def discover_api_resource_pages():
 
 
 # -------------------------------------------------------------------
+# IPBES Transformative Change Assessment
+# -------------------------------------------------------------------
+
+
+def get_ipbes_transformative_page():
+    """
+    Extract the IPBES Transformative Change citation page.
+    """
+
+    print(
+        "Reading IPBES Transformative "
+        "Change Assessment page..."
+    )
+
+    return extract_page(
+        IPBES_TRANSFORMATIVE_ROOT
+    )
+
+
+def get_ipbes_zenodo_dois():
+    """
+    Discover Zenodo DOI links listed on the IPBES
+    Transformative Change Assessment page.
+    """
+
+    doi_urls = set()
+
+    print(
+        "Discovering IPBES Transformative "
+        "Change Zenodo DOIs..."
+    )
+
+    try:
+
+        response = get_response(
+            IPBES_TRANSFORMATIVE_ROOT,
+            timeout=30,
+        )
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser",
+        )
+
+        for link in soup.find_all(
+            "a",
+            href=True,
+        ):
+
+            absolute_url = urljoin(
+                response.url,
+                link["href"],
+            )
+
+            parsed = urlparse(
+                absolute_url
+            )
+
+            if parsed.netloc not in [
+                "doi.org",
+                "www.doi.org",
+            ]:
+                continue
+
+            if (
+                "10.5281/zenodo."
+                not in absolute_url.lower()
+            ):
+                continue
+
+            doi_urls.add(
+                normalise_url(
+                    absolute_url
+                )
+            )
+
+    except Exception as exc:
+
+        print(
+            "Could not discover IPBES "
+            f"Zenodo DOIs: {exc}"
+        )
+
+    print(
+        f"{len(doi_urls)} IPBES Zenodo "
+        "DOI link(s) discovered"
+    )
+
+    return sorted(
+        doi_urls
+    )
+
+
+def resolve_zenodo_record_id(doi_url):
+    """
+    Follow a DOI and obtain its Zenodo record ID.
+    """
+
+    try:
+
+        response = get_response(
+            doi_url,
+            timeout=30,
+        )
+
+        final_url = response.url
+
+        match = re.search(
+            r"zenodo\.org/(?:records|record)/(\d+)",
+            final_url,
+        )
+
+        if not match:
+
+            print(
+                "Could not identify Zenodo "
+                f"record ID from {final_url}"
+            )
+
+            return None
+
+        return match.group(1)
+
+    except Exception as exc:
+
+        print(
+            f"Could not resolve DOI "
+            f"{doi_url}: {exc}"
+        )
+
+        return None
+
+
+def get_zenodo_record(record_id):
+    """
+    Read structured metadata for a Zenodo record.
+    """
+
+    try:
+
+        response = get_response(
+            ZENODO_API_BASE
+            + str(record_id),
+            timeout=30,
+        )
+
+        return response.json()
+
+    except Exception as exc:
+
+        print(
+            f"Could not read Zenodo record "
+            f"{record_id}: {exc}"
+        )
+
+        return None
+
+
+def get_zenodo_record_title(record):
+    """
+    Return a readable title for a Zenodo record.
+    """
+
+    if not record:
+        return ""
+
+    metadata = record.get(
+        "metadata",
+        {},
+    )
+
+    return metadata.get(
+        "title",
+        "",
+    )
+
+
+def get_zenodo_pdf_files(record):
+    """
+    Return publicly downloadable PDF files from a Zenodo record.
+    """
+
+    pdfs = []
+
+    if not record:
+        return pdfs
+
+    record_title = (
+        get_zenodo_record_title(
+            record
+        )
+    )
+
+    for file_data in record.get(
+        "files",
+        [],
+    ):
+
+        key = file_data.get(
+            "key",
+            "",
+        )
+
+        if not key.lower().endswith(
+            ".pdf"
+        ):
+            continue
+
+        links = file_data.get(
+            "links",
+            {},
+        )
+
+        download_url = (
+            links.get("content")
+            or links.get("self")
+        )
+
+        if not download_url:
+            continue
+
+        pdfs.append({
+            "title": (
+                record_title
+                or key
+            ),
+            "filename": key,
+            "url": download_url,
+        })
+
+    return pdfs
+
+
+def discover_ipbes_zenodo_pdfs():
+    """
+    Discover downloadable PDFs associated with the
+    Transformative Change Assessment Zenodo DOI records.
+    """
+
+    discovered = []
+
+    seen_urls = set()
+
+    doi_urls = (
+        get_ipbes_zenodo_dois()
+    )
+
+    for doi_url in doi_urls:
+
+        print(
+            f"Resolving IPBES DOI: "
+            f"{doi_url}"
+        )
+
+        record_id = (
+            resolve_zenodo_record_id(
+                doi_url
+            )
+        )
+
+        if not record_id:
+            continue
+
+        record = get_zenodo_record(
+            record_id
+        )
+
+        if not record:
+            continue
+
+        record_title = get_zenodo_record_title(record)
+
+        print(
+            "Zenodo record: "
+            f"{record_title}"
+        )
+
+        # The complete Full Report substantially duplicates the
+        # individually indexed SPM and chapter files. Excluding it
+        # prevents the assessment from being overweighted in retrieval
+        # while retaining the complete assessment evidence base.
+        if "full report" in record_title.lower():
+            print(
+                "Skipping IPBES Full Report PDF to avoid "
+                "duplicate chapter content."
+            )
+            continue
+
+        pdf_files = (
+            get_zenodo_pdf_files(
+                record
+            )
+        )
+
+        if not pdf_files:
+
+            print(
+                "No public PDF available "
+                f"for Zenodo record {record_id}"
+            )
+
+        for pdf in pdf_files:
+
+            if pdf["url"] in seen_urls:
+                continue
+
+            seen_urls.add(
+                pdf["url"]
+            )
+
+            discovered.append(
+                pdf
+            )
+
+    print(
+        f"{len(discovered)} downloadable "
+        "IPBES Zenodo PDF(s) discovered"
+    )
+
+    return discovered
+
+
+# -------------------------------------------------------------------
 # PDF extraction
 # -------------------------------------------------------------------
 
@@ -700,6 +1060,7 @@ def pdf_title_from_url(url):
     if filename.lower().endswith(
         ".pdf"
     ):
+
         filename = filename[:-4]
 
     filename = filename.replace(
@@ -718,22 +1079,33 @@ def pdf_title_from_url(url):
 def extract_pdf(url):
     """
     Download a PDF and extract text using pypdf.
+
+    The file is validated by attempting to parse the downloaded bytes
+    rather than relying on the HTTP Content-Type or URL suffix. This is
+    important for Zenodo /content endpoints, which may not end in .pdf.
     """
 
     try:
-
         response = get_response(
             url,
-            timeout=60,
+            timeout=120,
         )
 
-        pdf_file = io.BytesIO(
-            response.content
-        )
+        try:
+            pdf_file = io.BytesIO(
+                response.content
+            )
 
-        reader = pypdf.PdfReader(
-            pdf_file
-        )
+            reader = pypdf.PdfReader(
+                pdf_file
+            )
+
+        except Exception as exc:
+            print(
+                "Downloaded content could not "
+                f"be interpreted as a PDF: {url}: {exc}"
+            )
+            return None
 
         pages = []
 
@@ -741,9 +1113,7 @@ def extract_pdf(url):
             reader.pages,
             start=1,
         ):
-
             try:
-
                 page_text = (
                     page.extract_text()
                     or ""
@@ -754,14 +1124,12 @@ def extract_pdf(url):
                 )
 
                 if page_text:
-
                     pages.append(
                         f"[Page {page_number}] "
                         f"{page_text}"
                     )
 
             except Exception as exc:
-
                 print(
                     f"Could not read page "
                     f"{page_number} of "
@@ -773,29 +1141,25 @@ def extract_pdf(url):
         )
 
         if len(text) < 100:
-
             print(
                 "PDF contained too little "
                 f"extractable text: {url}"
             )
-
             return None
 
         return {
             "title": pdf_title_from_url(
-                url
+                response.url
             ),
-            "url": url,
+            "url": response.url,
             "text": text,
         }
 
     except Exception as exc:
-
         print(
             f"Could not extract PDF "
             f"{url}: {exc}"
         )
-
         return None
 
 
@@ -872,7 +1236,7 @@ def build_sources():
     )
 
     # ---------------------------------------------------------------
-    # 2. Retrieve authoritative resource collection
+    # 2. Retrieve authoritative BIONEXT resource collection
     # ---------------------------------------------------------------
 
     print()
@@ -899,9 +1263,13 @@ def build_sources():
 
         url = item["url"]
 
-        bionext_pages.add(url)
+        bionext_pages.add(
+            url
+        )
 
-        resource_metadata[url] = item
+        resource_metadata[
+            url
+        ] = item
 
     # ---------------------------------------------------------------
     # 3. Extract BIONEXT webpages
@@ -913,7 +1281,7 @@ def build_sources():
     )
     print()
 
-    pdf_links = set()
+    bionext_pdf_links = set()
 
     for url in sorted(
         bionext_pages
@@ -934,74 +1302,74 @@ def build_sources():
 
             final_url = extracted["url"]
 
-            if final_url in seen_page_urls:
-                continue
+            if final_url not in seen_page_urls:
 
-            metadata = (
-                resource_metadata.get(
-                    final_url,
-                    {}
-                )
-            )
-
-            if looks_like_resource_page(
-                final_url
-            ):
-
-                source_type = (
-                    "BIONEXT resource page"
+                metadata = (
+                    resource_metadata.get(
+                        final_url,
+                        {},
+                    )
                 )
 
-            elif (
-                "decision-analysis"
-                in final_url.lower()
-                or "decision-making"
-                in final_url.lower()
-            ):
+                if looks_like_resource_page(
+                    final_url
+                ):
 
-                source_type = (
-                    "Oppla BIONEXT "
-                    "decision-analysis page"
+                    source_type = (
+                        "BIONEXT resource page"
+                    )
+
+                elif (
+                    "decision-analysis"
+                    in final_url.lower()
+                    or "decision-making"
+                    in final_url.lower()
+                ):
+
+                    source_type = (
+                        "Oppla BIONEXT "
+                        "decision-analysis page"
+                    )
+
+                elif (
+                    "/article/"
+                    in final_url.lower()
+                ):
+
+                    source_type = (
+                        "BIONEXT article"
+                    )
+
+                else:
+
+                    source_type = (
+                        "Oppla BIONEXT page"
+                    )
+
+                raw_documents.append({
+                    "title": extracted["title"],
+                    "url": final_url,
+                    "source_type": source_type,
+                    "text": extracted["text"],
+                    "metadata": {
+                        "resource_nid": (
+                            metadata.get(
+                                "nid"
+                            )
+                        ),
+                        "publication_date": (
+                            metadata.get(
+                                "publication_date",
+                                "",
+                            )
+                        ),
+                    },
+                })
+
+                seen_page_urls.add(
+                    final_url
                 )
 
-            elif (
-                "/article/"
-                in final_url.lower()
-            ):
-
-                source_type = (
-                    "BIONEXT article"
-                )
-
-            else:
-
-                source_type = (
-                    "Oppla BIONEXT page"
-                )
-
-            raw_documents.append({
-                "title": extracted["title"],
-                "url": final_url,
-                "source_type": source_type,
-                "text": extracted["text"],
-                "metadata": {
-                    "resource_nid": (
-                        metadata.get("nid")
-                    ),
-                    "publication_date": (
-                        metadata.get(
-                            "publication_date",
-                            "",
-                        )
-                    ),
-                },
-            })
-
-            seen_page_urls.add(
-                final_url
-            )
-
-        # Discover PDFs linked from this page.
         for link in get_links_from_page(
             url
         ):
@@ -1010,25 +1378,57 @@ def build_sources():
                 link
             ):
 
-                pdf_links.add(
+                bionext_pdf_links.add(
                     link
                 )
 
     # ---------------------------------------------------------------
-    # 4. Extract linked PDFs
+    # 4. Add IPBES Transformative Change citation page
     # ---------------------------------------------------------------
 
     print()
     print(
-        "Reading linked PDFs..."
+        "Extracting IPBES Transformative "
+        "Change citation page..."
     )
     print()
 
-    pdfs_extracted = 0
-    pdfs_deduplicated = 0
+    ipbes_page = (
+        get_ipbes_transformative_page()
+    )
+
+    if ipbes_page:
+
+        raw_documents.append({
+            "title": ipbes_page["title"],
+            "url": ipbes_page["url"],
+            "source_type": (
+                "IPBES Transformative "
+                "Change Assessment"
+            ),
+            "text": ipbes_page["text"],
+            "metadata": {},
+        })
+
+        seen_page_urls.add(
+            ipbes_page["url"]
+        )
+
+    # ---------------------------------------------------------------
+    # 5. Extract BIONEXT-linked PDFs
+    # ---------------------------------------------------------------
+
+    print()
+    print(
+        "Reading BIONEXT-linked PDFs..."
+    )
+    print()
+
+    bionext_pdfs_extracted = 0
+    duplicate_pdfs = 0
 
     for pdf_url in sorted(
-        pdf_links
+        bionext_pdf_links
     ):
 
         print(
@@ -1053,7 +1453,7 @@ def build_sources():
                 f"{pdf_url}"
             )
 
-            pdfs_deduplicated += 1
+            duplicate_pdfs += 1
 
             continue
 
@@ -1069,15 +1469,87 @@ def build_sources():
             "metadata": {},
         })
 
-        pdfs_extracted += 1
+        bionext_pdfs_extracted += 1
 
     # ---------------------------------------------------------------
-    # 5. Approved external sources
+    # 6. Discover and extract IPBES Zenodo PDFs
     # ---------------------------------------------------------------
 
     print()
     print(
-        "Reading approved external "
+        "Reading IPBES Transformative "
+        "Change Zenodo PDFs..."
+    )
+    print()
+
+    zenodo_pdfs = (
+        discover_ipbes_zenodo_pdfs()
+    )
+
+    ipbes_zenodo_pdfs_extracted = 0
+
+    for pdf in zenodo_pdfs:
+
+        pdf_url = pdf["url"]
+
+        print(
+            "Reading IPBES Zenodo PDF: "
+            f"{pdf['title']}"
+        )
+
+        extracted = extract_pdf(
+            pdf_url
+        )
+
+        if not extracted:
+            continue
+
+        fingerprint = text_fingerprint(
+            extracted["text"]
+        )
+
+        if fingerprint in seen_pdf_content:
+
+            print(
+                "Duplicate PDF skipped: "
+                f"{pdf_url}"
+            )
+
+            duplicate_pdfs += 1
+
+            continue
+
+        seen_pdf_content.add(
+            fingerprint
+        )
+
+        raw_documents.append({
+            "title": pdf["title"],
+            "url": pdf_url,
+            "source_type": (
+                "IPBES Transformative "
+                "Change PDF"
+            ),
+            "text": extracted["text"],
+            "metadata": {
+                "filename": (
+                    pdf.get(
+                        "filename",
+                        "",
+                    )
+                ),
+            },
+        })
+
+        ipbes_zenodo_pdfs_extracted += 1
+
+    # ---------------------------------------------------------------
+    # 7. Other approved external sources
+    # ---------------------------------------------------------------
+
+    print()
+    print(
+        "Reading other approved external "
         "sources..."
     )
     print()
@@ -1106,7 +1578,7 @@ def build_sources():
         })
 
     # ---------------------------------------------------------------
-    # 6. Chunk for retrieval
+    # 8. Chunk for retrieval
     # ---------------------------------------------------------------
 
     print()
@@ -1130,7 +1602,7 @@ def build_sources():
             metadata=(
                 document.get(
                     "metadata",
-                    {}
+                    {},
                 )
             ),
         )
@@ -1141,7 +1613,7 @@ def build_sources():
         )
 
     # ---------------------------------------------------------------
-    # 7. Save
+    # 9. Save
     # ---------------------------------------------------------------
 
     with open(
@@ -1181,17 +1653,32 @@ def build_sources():
     )
 
     print(
-        f"{len(pdf_links)} "
-        "PDF links discovered"
+        "1 IPBES Transformative Change "
+        "citation page included"
     )
 
     print(
-        f"{pdfs_extracted} "
-        "unique PDFs extracted"
+        f"{len(bionext_pdf_links)} "
+        "BIONEXT-linked PDF URLs discovered"
     )
 
     print(
-        f"{pdfs_deduplicated} "
+        f"{bionext_pdfs_extracted} "
+        "unique BIONEXT PDFs extracted"
+    )
+
+    print(
+        f"{len(zenodo_pdfs)} "
+        "IPBES Zenodo PDF URLs discovered"
+    )
+
+    print(
+        f"{ipbes_zenodo_pdfs_extracted} "
+        "unique IPBES Zenodo PDFs extracted"
+    )
+
+    print(
+        f"{duplicate_pdfs} "
         "duplicate PDFs skipped"
     )
 
