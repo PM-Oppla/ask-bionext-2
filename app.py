@@ -17,7 +17,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v16
+# App v17
 #
 # Focus of this version:
 # - source-bounded answers
@@ -29,6 +29,7 @@ from xml.sax.saxutils import escape as xml_escape
 # - source-type filtering
 # - grouped citations
 # - clearer evidence-source presentation
+# - evidence list limited to sources actually cited in the answer
 # - Word and Markdown answer export
 # - streamed answer generation
 # - limited session-based conversational memory
@@ -1555,6 +1556,73 @@ Approved source material:
 
 
 # -------------------------------------------------------------------
+# Citation/source alignment
+# -------------------------------------------------------------------
+
+
+def get_cited_source_groups(
+    answer,
+    groups,
+):
+    """
+    Return only the evidence sources explicitly cited in the generated answer.
+
+    The answer model receives grouped sources numbered [1], [2], etc. This
+    helper preserves those original source numbers when displaying and
+    exporting the evidence list.
+
+    If a supported answer unexpectedly contains no valid citations, all
+    available groups are returned as a transparency fallback.
+    """
+
+    if not groups:
+        return []
+
+    cited_numbers = []
+    seen = set()
+
+    for match in re.finditer(
+        r"\[(\d+)\]",
+        answer or "",
+    ):
+        number = int(
+            match.group(1)
+        )
+
+        if (
+            1 <= number <= len(groups)
+            and number not in seen
+        ):
+            seen.add(number)
+            cited_numbers.append(number)
+
+    if not cited_numbers:
+        cited_numbers = list(
+            range(
+                1,
+                len(groups) + 1,
+            )
+        )
+
+    cited_groups = []
+
+    for number in cited_numbers:
+        group_copy = dict(
+            groups[number - 1]
+        )
+
+        group_copy[
+            "_citation_number"
+        ] = number
+
+        cited_groups.append(
+            group_copy
+        )
+
+    return cited_groups
+
+
+# -------------------------------------------------------------------
 # Answer export
 # -------------------------------------------------------------------
 
@@ -1606,10 +1674,14 @@ def build_markdown_export(
             ]
         )
 
-        for number, group in enumerate(
+        for fallback_number, group in enumerate(
             groups,
             start=1,
         ):
+            number = group.get(
+                "_citation_number",
+                fallback_number,
+            )
             title = str(
                 group.get(
                     "title",
@@ -1908,10 +1980,14 @@ def build_docx_export(
             )
         )
 
-        for number, group in enumerate(
+        for fallback_number, group in enumerate(
             groups,
             start=1,
         ):
+            number = group.get(
+                "_citation_number",
+                fallback_number,
+            )
             title = str(
                 group.get(
                     "title",
@@ -2225,10 +2301,14 @@ def source_domain(url):
 
 
 def render_source_cards(groups):
-    for number, group in enumerate(
+    for fallback_number, group in enumerate(
         groups,
         start=1,
     ):
+        number = group.get(
+            "_citation_number",
+            fallback_number,
+        )
         provenance, badge_class = (
             classify_source(
                 group
@@ -2658,7 +2738,16 @@ if (
 
                     final_answer = streamed_answer
 
-                if groups:
+                cited_groups = (
+                    get_cited_source_groups(
+                        final_answer,
+                        groups,
+                    )
+                    if not unsupported
+                    else []
+                )
+
+                if cited_groups:
                     st.markdown(
                         "### Evidence sources"
                     )
@@ -2666,8 +2755,8 @@ if (
                     st.markdown(
                         f"""
                         <div class="source-list-intro">
-                          The answer above cites {len(groups)} source{
-                              "" if len(groups) == 1 else "s"
+                          The answer above cites {len(cited_groups)} source{
+                              "" if len(cited_groups) == 1 else "s"
                           } from the approved evidence base. Citation numbers
                           correspond directly to the entries below.
                         </div>
@@ -2676,13 +2765,13 @@ if (
                     )
 
                     render_source_cards(
-                        groups
+                        cited_groups
                     )
 
                 render_export_buttons(
                     question,
                     final_answer,
-                    groups,
+                    cited_groups,
                     key_prefix=(
                         "current_export_"
                         + str(
@@ -2701,7 +2790,7 @@ if (
                     {
                         "question": question,
                         "answer": final_answer,
-                        "groups": groups,
+                        "groups": cited_groups,
                     }
                 )
 
