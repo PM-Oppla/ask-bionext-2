@@ -1,17 +1,23 @@
 import base64
+import html
+import io
 import json
 import math
 import os
 import re
 import time
+import zipfile
 
 import streamlit as st
 from openai import OpenAI
+from urllib.parse import urlparse
+from datetime import datetime
+from xml.sax.saxutils import escape as xml_escape
 
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v14
+# App v16
 #
 # Focus of this version:
 # - source-bounded answers
@@ -22,6 +28,8 @@ from openai import OpenAI
 # - route-aware source weighting
 # - source-type filtering
 # - grouped citations
+# - clearer evidence-source presentation
+# - Word and Markdown answer export
 # - streamed answer generation
 # - limited session-based conversational memory
 # - two-stage evidence gate for weak / unsupported questions
@@ -144,22 +152,105 @@ st.markdown(
       margin: 0.5rem 0 0.35rem 0;
     }
 
+    .source-list-intro {
+      color: #667277;
+      font-size: 0.88rem;
+      margin: -0.15rem 0 0.55rem 0;
+    }
+
     .source-card {
       border-top: 1px solid var(--bionext-line);
-      padding: 0.65rem 0 0.45rem 0;
+      padding: 0.72rem 0 0.58rem 0;
+    }
+
+    .source-card:first-of-type {
+      border-top: 0;
+    }
+
+    .source-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.55rem;
     }
 
     .source-num {
-      display: inline-block;
-      min-width: 1.8rem;
-      color: var(--bionext-olive);
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 auto;
+      min-width: 2rem;
+      height: 1.65rem;
+      padding: 0 0.3rem;
+      border: 1px solid var(--bionext-olive);
+      border-radius: 999px;
+      color: var(--bionext-olive-dark);
       font-weight: 800;
+      font-size: 0.82rem;
+      line-height: 1;
     }
 
-    .source-type {
+    .source-main {
+      min-width: 0;
+      flex: 1;
+    }
+
+    .source-title {
+      font-weight: 800;
+      line-height: 1.3;
+    }
+
+    .source-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.38rem 0.6rem;
+      align-items: center;
       color: #68747A;
-      font-size: 0.82rem;
-      margin-top: 0.12rem;
+      font-size: 0.8rem;
+      margin-top: 0.24rem;
+    }
+
+    .source-badge {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 0.12rem 0.46rem;
+      font-size: 0.7rem;
+      line-height: 1.25;
+      font-weight: 800;
+      letter-spacing: 0.035em;
+      text-transform: uppercase;
+      background: #EEF1D9;
+      color: #67691F;
+      border: 1px solid #D7DAA2;
+    }
+
+    .source-badge.external {
+      background: #EEF3F5;
+      color: var(--bionext-navy);
+      border-color: #CCD8DD;
+    }
+
+    .source-domain {
+      overflow-wrap: anywhere;
+    }
+
+    .source-open {
+      white-space: nowrap;
+      font-weight: 700;
+      font-size: 0.78rem;
+    }
+
+    .export-label {
+      color: var(--bionext-navy);
+      font-weight: 800;
+      font-size: 0.9rem;
+      margin: 1rem 0 0.35rem 0;
+    }
+
+    .export-note {
+      color: #68747A;
+      font-size: 0.8rem;
+      margin-top: -0.15rem;
+      margin-bottom: 0.4rem;
     }
 
     .footer-shell {
@@ -1464,6 +1555,587 @@ Approved source material:
 
 
 # -------------------------------------------------------------------
+# Answer export
+# -------------------------------------------------------------------
+
+
+def safe_export_filename(question):
+    """
+    Create a short filesystem-safe filename from the question.
+    """
+
+    cleaned = re.sub(
+        r"[^A-Za-z0-9]+",
+        "-",
+        question.strip(),
+    ).strip("-").lower()
+
+    if not cleaned:
+        cleaned = "answer"
+
+    return cleaned[:60]
+
+
+def build_markdown_export(
+    question,
+    answer,
+    groups,
+):
+    """
+    Build a portable Markdown export of one Ask BIONEXT answer.
+    """
+
+    lines = [
+        "# Ask BIONEXT 2.0",
+        "",
+        "## Question",
+        "",
+        question.strip(),
+        "",
+        "## Answer",
+        "",
+        answer.strip(),
+        "",
+    ]
+
+    if groups:
+        lines.extend(
+            [
+                "## Evidence sources",
+                "",
+            ]
+        )
+
+        for number, group in enumerate(
+            groups,
+            start=1,
+        ):
+            title = str(
+                group.get(
+                    "title",
+                    "Untitled source",
+                )
+            ).strip()
+
+            source_type = (
+                humanise_source_type(
+                    group.get(
+                        "source_type",
+                        "",
+                    )
+                )
+            )
+
+            url = str(
+                group.get(
+                    "url",
+                    "",
+                )
+            ).strip()
+
+            lines.append(
+                f"{number}. **{title}**"
+            )
+
+            if source_type:
+                lines.append(
+                    f"   - Source type: {source_type}"
+                )
+
+            if url:
+                lines.append(
+                    f"   - URL: {url}"
+                )
+
+            lines.append("")
+
+    lines.extend(
+        [
+            "---",
+            "",
+            (
+                "Generated by Ask BIONEXT 2.0 from the approved "
+                "BIONEXT evidence base. Source links are provided "
+                "for verification."
+            ),
+        ]
+    )
+
+    return "\n".join(lines)
+
+
+def markdown_to_export_lines(markdown_text):
+    """
+    Convert the limited Markdown used in answers into readable plain-text
+    lines for the Word export while preserving headings and list structure.
+    """
+
+    export_lines = []
+
+    for raw_line in markdown_text.splitlines():
+        line = raw_line.rstrip()
+
+        if not line:
+            export_lines.append(
+                {
+                    "text": "",
+                    "kind": "blank",
+                }
+            )
+            continue
+
+        heading_match = re.match(
+            r"^(#{1,6})\s+(.*)$",
+            line,
+        )
+
+        if heading_match:
+            export_lines.append(
+                {
+                    "text": heading_match.group(2),
+                    "kind": "heading",
+                }
+            )
+            continue
+
+        bullet_match = re.match(
+            r"^\s*[-*]\s+(.*)$",
+            line,
+        )
+
+        if bullet_match:
+            line = (
+                "• "
+                + bullet_match.group(1)
+            )
+
+        # Remove common inline Markdown while keeping the visible text.
+        line = re.sub(
+            r"\*\*(.*?)\*\*",
+            r"\1",
+            line,
+        )
+        line = re.sub(
+            r"__(.*?)__",
+            r"\1",
+            line,
+        )
+        line = re.sub(
+            r"`([^`]*)`",
+            r"\1",
+            line,
+        )
+        line = re.sub(
+            r"\[([^\]]+)\]\(([^)]+)\)",
+            r"\1 (\2)",
+            line,
+        )
+
+        export_lines.append(
+            {
+                "text": line,
+                "kind": "body",
+            }
+        )
+
+    return export_lines
+
+
+def docx_run_xml(
+    text_value,
+    bold=False,
+    size=22,
+):
+    """
+    Create a WordprocessingML run.
+    """
+
+    text_value = str(
+        text_value
+    )
+
+    preserve = (
+        ' xml:space="preserve"'
+        if (
+            text_value.startswith(" ")
+            or text_value.endswith(" ")
+        )
+        else ""
+    )
+
+    run_properties = (
+        "<w:rPr>"
+        + (
+            "<w:b/>"
+            if bold
+            else ""
+        )
+        + f'<w:sz w:val="{size}"/>'
+        + f'<w:szCs w:val="{size}"/>'
+        + "</w:rPr>"
+    )
+
+    return (
+        "<w:r>"
+        f"{run_properties}"
+        f"<w:t{preserve}>"
+        f"{xml_escape(text_value)}"
+        "</w:t>"
+        "</w:r>"
+    )
+
+
+def docx_paragraph_xml(
+    text_value="",
+    bold=False,
+    size=22,
+    space_after=100,
+):
+    """
+    Create a simple WordprocessingML paragraph.
+    """
+
+    return (
+        "<w:p>"
+        "<w:pPr>"
+        f'<w:spacing w:after="{space_after}"/>'
+        "</w:pPr>"
+        + docx_run_xml(
+            text_value,
+            bold=bold,
+            size=size,
+        )
+        + "</w:p>"
+    )
+
+
+def build_docx_export(
+    question,
+    answer,
+    groups,
+):
+    """
+    Build a dependency-free .docx file containing one answer and its sources.
+
+    The document is created directly as Office Open XML so the deployed app
+    does not require an additional Python package solely for export.
+    """
+
+    paragraphs = []
+
+    paragraphs.append(
+        docx_paragraph_xml(
+            "Ask BIONEXT 2.0",
+            bold=True,
+            size=34,
+            space_after=80,
+        )
+    )
+
+    paragraphs.append(
+        docx_paragraph_xml(
+            "Exported answer",
+            bold=True,
+            size=24,
+            space_after=220,
+        )
+    )
+
+    paragraphs.append(
+        docx_paragraph_xml(
+            "Question",
+            bold=True,
+            size=24,
+            space_after=80,
+        )
+    )
+
+    paragraphs.append(
+        docx_paragraph_xml(
+            question.strip(),
+            size=22,
+            space_after=220,
+        )
+    )
+
+    paragraphs.append(
+        docx_paragraph_xml(
+            "Answer",
+            bold=True,
+            size=24,
+            space_after=80,
+        )
+    )
+
+    for item in markdown_to_export_lines(
+        answer
+    ):
+        if item["kind"] == "heading":
+            paragraphs.append(
+                docx_paragraph_xml(
+                    item["text"],
+                    bold=True,
+                    size=24,
+                    space_after=100,
+                )
+            )
+
+        elif item["kind"] == "blank":
+            paragraphs.append(
+                docx_paragraph_xml(
+                    "",
+                    size=22,
+                    space_after=60,
+                )
+            )
+
+        else:
+            paragraphs.append(
+                docx_paragraph_xml(
+                    item["text"],
+                    size=22,
+                    space_after=90,
+                )
+            )
+
+    if groups:
+        paragraphs.append(
+            docx_paragraph_xml(
+                "Evidence sources",
+                bold=True,
+                size=24,
+                space_after=100,
+            )
+        )
+
+        for number, group in enumerate(
+            groups,
+            start=1,
+        ):
+            title = str(
+                group.get(
+                    "title",
+                    "Untitled source",
+                )
+            ).strip()
+
+            source_type = (
+                humanise_source_type(
+                    group.get(
+                        "source_type",
+                        "",
+                    )
+                )
+            )
+
+            url = str(
+                group.get(
+                    "url",
+                    "",
+                )
+            ).strip()
+
+            paragraphs.append(
+                docx_paragraph_xml(
+                    f"[{number}] {title}",
+                    bold=True,
+                    size=21,
+                    space_after=40,
+                )
+            )
+
+            if source_type:
+                paragraphs.append(
+                    docx_paragraph_xml(
+                        f"Source type: {source_type}",
+                        size=19,
+                        space_after=30,
+                    )
+                )
+
+            if url:
+                paragraphs.append(
+                    docx_paragraph_xml(
+                        f"URL: {url}",
+                        size=19,
+                        space_after=110,
+                    )
+                )
+
+    paragraphs.append(
+        docx_paragraph_xml(
+            (
+                "Generated by Ask BIONEXT 2.0 from the approved "
+                "BIONEXT evidence base. Source links are provided "
+                "for verification."
+            ),
+            size=18,
+            space_after=40,
+        )
+    )
+
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document '
+        'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        "<w:body>"
+        + "".join(paragraphs)
+        + (
+            "<w:sectPr>"
+            '<w:pgSz w:w="11906" w:h="16838"/>'
+            '<w:pgMar w:top="1440" w:right="1440" '
+            'w:bottom="1440" w:left="1440" '
+            'w:header="708" w:footer="708" w:gutter="0"/>'
+            "</w:sectPr>"
+        )
+        + "</w:body>"
+        "</w:document>"
+    )
+
+    content_types_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" '
+        'ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/word/document.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.'
+        'wordprocessingml.document.main+xml"/>'
+        "</Types>"
+    )
+
+    package_relationships_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships '
+        'xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/'
+        'relationships/officeDocument" '
+        'Target="word/document.xml"/>'
+        "</Relationships>"
+    )
+
+    output = io.BytesIO()
+
+    with zipfile.ZipFile(
+        output,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as docx_zip:
+        docx_zip.writestr(
+            "[Content_Types].xml",
+            content_types_xml,
+        )
+        docx_zip.writestr(
+            "_rels/.rels",
+            package_relationships_xml,
+        )
+        docx_zip.writestr(
+            "word/document.xml",
+            document_xml,
+        )
+
+    output.seek(0)
+
+    return output.getvalue()
+
+
+def render_export_buttons(
+    question,
+    answer,
+    groups,
+    key_prefix,
+):
+    """
+    Render Word and Markdown downloads for one supported answer.
+    """
+
+    if (
+        not answer
+        or answer.startswith(
+            "I could not find sufficient evidence"
+        )
+    ):
+        return
+
+    base_name = (
+        "ask-bionext-"
+        + safe_export_filename(
+            question
+        )
+    )
+
+    markdown_data = (
+        build_markdown_export(
+            question,
+            answer,
+            groups,
+        )
+    )
+
+    docx_data = (
+        build_docx_export(
+            question,
+            answer,
+            groups,
+        )
+    )
+
+    st.markdown(
+        '<div class="export-label">Export this answer</div>',
+        unsafe_allow_html=True,
+    )
+
+    st.markdown(
+        """
+        <div class="export-note">
+          Downloads include the question, answer and evidence-source list.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    export_columns = st.columns(2)
+
+    with export_columns[0]:
+        st.download_button(
+            "Download Word (.docx)",
+            data=docx_data,
+            file_name=(
+                base_name
+                + ".docx"
+            ),
+            mime=(
+                "application/vnd.openxmlformats-officedocument."
+                "wordprocessingml.document"
+            ),
+            key=(
+                key_prefix
+                + "_docx"
+            ),
+            use_container_width=True,
+        )
+
+    with export_columns[1]:
+        st.download_button(
+            "Download Markdown (.md)",
+            data=markdown_data.encode(
+                "utf-8"
+            ),
+            file_name=(
+                base_name
+                + ".md"
+            ),
+            mime="text/markdown",
+            key=(
+                key_prefix
+                + "_md"
+            ),
+            use_container_width=True,
+        )
+
+
+# -------------------------------------------------------------------
 # Interface
 # -------------------------------------------------------------------
 
@@ -1477,19 +2149,157 @@ def clear_conversation():
     st.session_state["question_input"] = ""
 
 
+def classify_source(group):
+    """
+    Return a short provenance label and styling class for a grouped source.
+    """
+
+    source_type = (
+        group.get(
+            "source_type",
+            "",
+        )
+        or ""
+    )
+
+    source_type_lower = (
+        source_type.lower()
+    )
+
+    if "bionext" in source_type_lower:
+        return (
+            "BIONEXT",
+            "bionext",
+        )
+
+    if "ipbes" in source_type_lower:
+        return (
+            "IPBES",
+            "external",
+        )
+
+    if "cordis" in source_type_lower:
+        return (
+            "CORDIS",
+            "external",
+        )
+
+    return (
+        "External",
+        "external",
+    )
+
+
+def humanise_source_type(source_type):
+    """
+    Keep source-type labels concise and readable in the evidence list.
+    """
+
+    if not source_type:
+        return "Source"
+
+    cleaned = (
+        str(source_type)
+        .replace("_", " ")
+        .strip()
+    )
+
+    return cleaned
+
+
+def source_domain(url):
+    try:
+        domain = (
+            urlparse(url)
+            .netloc
+            .lower()
+        )
+
+        if domain.startswith("www."):
+            domain = domain[4:]
+
+        return domain or "source link"
+
+    except Exception:
+        return "source link"
+
+
 def render_source_cards(groups):
     for number, group in enumerate(
         groups,
         start=1,
     ):
+        provenance, badge_class = (
+            classify_source(
+                group
+            )
+        )
+
+        title = html.escape(
+            str(
+                group.get(
+                    "title",
+                    "Untitled source",
+                )
+            )
+        )
+
+        url = html.escape(
+            str(
+                group.get(
+                    "url",
+                    "",
+                )
+            ),
+            quote=True,
+        )
+
+        source_type = html.escape(
+            humanise_source_type(
+                group.get(
+                    "source_type",
+                    "",
+                )
+            )
+        )
+
+        domain = html.escape(
+            source_domain(
+                group.get(
+                    "url",
+                    "",
+                )
+            )
+        )
+
         st.markdown(
             f"""
             <div class="source-card">
-              <span class="source-num">[{number}]</span>
-              <a href="{group['url']}" target="_blank">
-                <strong>{group['title']}</strong>
-              </a>
-              <div class="source-type">{group['source_type']}</div>
+              <div class="source-row">
+                <span class="source-num">[{number}]</span>
+                <div class="source-main">
+                  <div class="source-title">
+                    <a href="{url}" target="_blank" rel="noopener noreferrer">
+                      {title}
+                    </a>
+                  </div>
+                  <div class="source-meta">
+                    <span class="source-badge {badge_class}">
+                      {provenance}
+                    </span>
+                    <span>{source_type}</span>
+                    <span class="source-domain">{domain}</span>
+                    <a
+                      class="source-open"
+                      href="{url}"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
+                      Open source ↗
+                    </a>
+                  </div>
+                </div>
+              </div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1524,12 +2334,54 @@ def render_conversation_history(history):
 
         if groups:
             with st.expander(
-                "Sources used for this answer",
+                f"Evidence sources ({len(groups)})",
                 expanded=False,
             ):
+                st.markdown(
+                    """
+                    <div class="source-list-intro">
+                      Citation numbers in the answer correspond to the sources
+                      below. BIONEXT and external evidence are labelled
+                      separately.
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
                 render_source_cards(
                     groups
                 )
+
+        render_export_buttons(
+            turn.get(
+                "question",
+                "",
+            ),
+            turn.get(
+                "answer",
+                "",
+            ),
+            groups,
+            key_prefix=(
+                "history_export_"
+                + str(
+                    abs(
+                        hash(
+                            (
+                                turn.get(
+                                    "question",
+                                    "",
+                                ),
+                                turn.get(
+                                    "answer",
+                                    "",
+                                )[:200],
+                            )
+                        )
+                    )
+                )
+            ),
+        )
 
 
 def render_brand_header():
@@ -1808,12 +2660,40 @@ if (
 
                 if groups:
                     st.markdown(
-                        "### Sources used"
+                        "### Evidence sources"
+                    )
+
+                    st.markdown(
+                        f"""
+                        <div class="source-list-intro">
+                          The answer above cites {len(groups)} source{
+                              "" if len(groups) == 1 else "s"
+                          } from the approved evidence base. Citation numbers
+                          correspond directly to the entries below.
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
                     )
 
                     render_source_cards(
                         groups
                     )
+
+                render_export_buttons(
+                    question,
+                    final_answer,
+                    groups,
+                    key_prefix=(
+                        "current_export_"
+                        + str(
+                            len(
+                                st.session_state[
+                                    "conversation_history"
+                                ]
+                            )
+                        )
+                    ),
+                )
 
                 st.session_state[
                     "conversation_history"
