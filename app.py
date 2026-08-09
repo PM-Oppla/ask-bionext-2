@@ -17,7 +17,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v17
+# App v18
 #
 # Focus of this version:
 # - source-bounded answers
@@ -30,6 +30,7 @@ from xml.sax.saxutils import escape as xml_escape
 # - grouped citations
 # - clearer evidence-source presentation
 # - evidence list limited to sources actually cited in the answer
+# - source database cache refresh every 5 minutes
 # - Word and Markdown answer export
 # - streamed answer generation
 # - limited session-based conversational memory
@@ -461,7 +462,7 @@ client = OpenAI(
 # -------------------------------------------------------------------
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=300)
 def load_sources():
     try:
         with open(
