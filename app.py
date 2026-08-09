@@ -11,7 +11,7 @@ from openai import OpenAI
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v11
+# App v12
 #
 # Focus of this version:
 # - source-bounded answers
@@ -82,39 +82,6 @@ st.markdown(
       padding-bottom: 2rem;
     }
 
-    .top-nav {
-      background: var(--bionext-navy);
-      margin: -1.6rem -4.5rem 1.6rem -4.5rem;
-      padding: 0.7rem 4.5rem;
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 1rem;
-      border-bottom: 2px solid var(--bionext-olive);
-    }
-
-    .top-nav img {
-      width: 150px;
-      display: block;
-    }
-
-    .top-nav-links {
-      display: flex;
-      gap: 1.25rem;
-      align-items: center;
-      flex-wrap: wrap;
-    }
-
-    .top-nav-links a {
-      color: white !important;
-      text-decoration: none !important;
-      font-weight: 700;
-      font-size: 0.92rem;
-    }
-
-    .top-nav-links a:hover {
-      color: #DDE3A5 !important;
-    }
 
     .brand-shell {
       border-top: 6px solid var(--bionext-olive);
@@ -314,13 +281,6 @@ st.markdown(
       }
       .brand-logo {
         width: 220px;
-      }
-      .top-nav {
-        margin: -1.6rem -1rem 1.2rem -1rem;
-        padding: 0.75rem 1rem;
-      }
-      .top-nav-links {
-        display: none;
       }
     }
     </style>
@@ -1333,20 +1293,7 @@ def set_example_question(example):
 
 def render_brand_header():
     st.markdown(
-        f"""
-        <div class="top-nav">
-          <img
-            src="data:image/png;base64,{BIONEXT_LOGO_B64}"
-            alt="BIONEXT"
-          />
-          <div class="top-nav-links">
-            <a href="https://www.bionext-project.eu/" target="_blank">About</a>
-            <a href="https://oppla.eu/bionext/bionext-resources" target="_blank">Library</a>
-            <a href="https://www.bionext-project.eu/contact/" target="_blank">Contact</a>
-            <a href="https://www.bionext-project.eu/news/" target="_blank">News</a>
-          </div>
-        </div>
-
+        """
         <div class="brand-shell">
           <div class="section-kicker">BIONEXT research assistant</div>
           <h1 class="app-title">Ask BIONEXT 2.0</h1>
