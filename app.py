@@ -17,7 +17,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v18
+# App v20
 #
 # Focus of this version:
 # - source-bounded answers
@@ -536,6 +536,50 @@ def load_sources():
 
 
 # -------------------------------------------------------------------
+# Retrieval-query normalisation
+# -------------------------------------------------------------------
+
+
+def normalise_retrieval_question(question):
+    """
+    Expand a small set of important BIONEXT/domain abbreviations and spelling
+    variants before retrieval.
+
+    This improves recall for short acronym queries such as "What is MCDA?"
+    without changing the user's visible question or relaxing the evidence gate.
+    """
+    if not question:
+        return question
+
+    normalised = question.strip()
+    lower = normalised.lower()
+
+    full_mcda_pattern = (
+        r"\bmulti[-\s]+criteria\s+decision\s+analysis\b"
+    )
+
+    if (
+        re.search(r"\bmcda\b", lower)
+        and not re.search(full_mcda_pattern, lower)
+    ):
+        normalised = re.sub(
+            r"\bmcda\b",
+            "multi-criteria decision analysis (MCDA)",
+            normalised,
+            flags=re.IGNORECASE,
+        )
+
+    normalised = re.sub(
+        full_mcda_pattern,
+        "multi-criteria decision analysis (MCDA)",
+        normalised,
+        flags=re.IGNORECASE,
+    )
+
+    return normalised
+
+
+# -------------------------------------------------------------------
 # Routing
 # -------------------------------------------------------------------
 
@@ -909,6 +953,39 @@ def keyword_score(question, source):
     ) / 10
 
 
+def concept_match_bonus(question, source):
+    """
+    Add a small exact-concept bonus for important domain terms whose short
+    forms can otherwise be weak semantic queries.
+
+    The bonus does not create evidence. It only helps chunks that actually
+    contain the requested concept rise within the already approved corpus.
+    """
+    q = question.lower().replace("-", " ")
+    title = source["parent_title"].lower().replace("-", " ")
+    body = source["text"].lower().replace("-", " ")
+    source_text = title + "\n" + body
+
+    asks_about_mcda = (
+        re.search(r"\bmcda\b", q) is not None
+        or "multi criteria decision analysis" in q
+    )
+
+    if asks_about_mcda:
+        contains_mcda = (
+            re.search(r"\bmcda\b", source_text) is not None
+            or "multi criteria decision analysis" in source_text
+        )
+
+        if contains_mcda:
+            return 0.080
+
+        if "decision analysis: the basics" in title:
+            return 0.060
+
+    return 0.0
+
+
 # -------------------------------------------------------------------
 # Retrieval
 # -------------------------------------------------------------------
@@ -965,12 +1042,19 @@ def retrieve_sources(
             source,
         )
 
-        # Semantic relevance remains dominant. The source prior is deliberately
-        # small: it resolves close calls rather than overriding poor relevance.
+        concept_bonus = concept_match_bonus(
+            question,
+            source,
+        )
+
+        # Semantic relevance remains dominant. Source/concept bonuses are
+        # deliberately small and only help clearly matching approved evidence
+        # rise above more generic decision-analysis material.
         combined_score = (
             semantic * 0.86
             + lexical * 0.14
             + priority
+            + concept_bonus
         )
 
         scored.append({
@@ -978,6 +1062,7 @@ def retrieve_sources(
             "semantic_score": semantic,
             "keyword_score": lexical,
             "priority_bonus": priority,
+            "concept_bonus": concept_bonus,
             "retrieval_score": combined_score,
         })
 
@@ -1288,6 +1373,66 @@ CURRENT QUESTION:
 
 
 # -------------------------------------------------------------------
+# Strong concept evidence checks
+# -------------------------------------------------------------------
+
+
+def has_strong_mcda_evidence(question, retrieved):
+    """
+    Return True only when an MCDA definition query has retrieved explicit,
+    high-confidence BIONEXT Decision Analysis evidence.
+
+    This is intentionally narrow. It does not weaken the general evidence gate;
+    it only prevents the gate from rejecting a short acronym/terminology query
+    when the correct approved BIONEXT evidence has already been retrieved with
+    a strong score.
+    """
+    if not question or not retrieved:
+        return False
+
+    q = question.lower().replace("-", " ")
+
+    asks_about_mcda = (
+        re.search(r"\bmcda\b", q) is not None
+        or "multi criteria decision analysis" in q
+    )
+
+    if not asks_about_mcda:
+        return False
+
+    for item in retrieved[:3]:
+        if not is_bionext_source(item):
+            continue
+
+        title = item["parent_title"].lower().replace("-", " ")
+        body = item["text"].lower().replace("-", " ")
+        source_text = title + "\n" + body
+
+        contains_mcda = (
+            re.search(r"\bmcda\b", source_text) is not None
+            or "multi criteria decision analysis" in source_text
+        )
+
+        is_decision_analysis_page = (
+            "decision-analysis" in item["source_type"].lower()
+            or "decision analysis" in title
+        )
+
+        strong_score = (
+            item.get("retrieval_score", 0.0) >= 0.60
+        )
+
+        if (
+            contains_mcda
+            and is_decision_analysis_page
+            and strong_score
+        ):
+            return True
+
+    return False
+
+
+# -------------------------------------------------------------------
 # Evidence answerability check
 # -------------------------------------------------------------------
 
@@ -1412,6 +1557,10 @@ def generate_answer(
         )
     )
 
+    retrieval_question = normalise_retrieval_question(
+        retrieval_question
+    )
+
     sources = load_sources()
 
     retrieved, route = retrieve_sources(
@@ -1447,9 +1596,17 @@ def generate_answer(
         retrieved
     )
 
-    if not evidence_supports_question(
+    strong_mcda_support = has_strong_mcda_evidence(
         retrieval_question,
-        groups,
+        retrieved,
+    )
+
+    if (
+        not strong_mcda_support
+        and not evidence_supports_question(
+            retrieval_question,
+            groups,
+        )
     ):
         return (
             "I could not find sufficient evidence within the approved "
@@ -2810,6 +2967,14 @@ if (
                             f"Search route: {route}"
                         )
 
+                        if has_strong_mcda_evidence(
+                            question,
+                            retrieved,
+                        ):
+                            st.caption(
+                                "Strong MCDA evidence override: active"
+                            )
+
                         for item in retrieved:
                             st.write(
                                 f"**{item['title']}**"
@@ -2820,6 +2985,7 @@ if (
                                 f"semantic {item['semantic_score']:.3f} · "
                                 f"keyword {item['keyword_score']:.3f} · "
                                 f"priority +{item['priority_bonus']:.3f} · "
+                                f"concept +{item.get('concept_bonus', 0.0):.3f} · "
                                 f"combined {item['retrieval_score']:.3f}"
                             )
 
