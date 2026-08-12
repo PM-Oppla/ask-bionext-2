@@ -17,7 +17,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v20
+# App v21
 #
 # Focus of this version:
 # - source-bounded answers
@@ -623,6 +623,17 @@ def route_question(question):
     if any(
         term in q
         for term in [
+            "case study",
+            "case studies",
+            "case-study",
+            "case-studies",
+        ]
+    ):
+        return "BIONEXT case-studies route"
+
+    if any(
+        term in q
+        for term in [
             "resource",
             "policy brief",
             "report",
@@ -693,6 +704,12 @@ def source_priority_bonus(route, source):
             bonus += 0.060
         elif is_bionext_source(source):
             bonus += 0.015
+
+    elif route == "BIONEXT case-studies route":
+        if "bionext case study" in source_type:
+            bonus += 0.070
+        elif is_bionext_source(source):
+            bonus += 0.010
 
     elif route == "BIONEXT resources route":
         if "bionext resource page" in source_type:
