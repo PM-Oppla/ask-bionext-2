@@ -17,7 +17,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 # -------------------------------------------------------------------
 # Ask BIONEXT 2.0
-# App v21
+# App v24
 #
 # Focus of this version:
 # - source-bounded answers
@@ -970,6 +970,133 @@ def keyword_score(question, source):
     ) / 10
 
 
+def _normalised_title_words(text):
+    """
+    Return useful lowercase tokens for matching short user references against
+    BIONEXT case-study titles.
+
+    Generic conversational words and generic project/case-study terms are
+    removed so that a query such as "Tell me about Dartmoor" is matched on
+    "dartmoor", rather than on uninformative words such as "tell" or "about".
+    """
+    words = re.findall(
+        r"[a-z0-9][a-z0-9'-]*",
+        text.lower().replace("&", " and "),
+    )
+
+    stop_words = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "about",
+        "bionext",
+        "can",
+        "case",
+        "cases",
+        "could",
+        "do",
+        "does",
+        "for",
+        "from",
+        "give",
+        "how",
+        "in",
+        "is",
+        "me",
+        "of",
+        "on",
+        "project",
+        "projects",
+        "restoration",
+        "study",
+        "studies",
+        "tell",
+        "the",
+        "this",
+        "to",
+        "what",
+        "which",
+        "with",
+        "you",
+    }
+
+    return [
+        word.strip("-'")
+        for word in words
+        if word.strip("-'")
+        and word.strip("-'") not in stop_words
+    ]
+
+
+def case_study_title_match_score(question, source):
+    """
+    Score distinctive partial-title matches for approved BIONEXT case studies.
+
+    This is intentionally restricted to the case-study source type. It helps
+    natural shorthand such as "Dartmoor", "Carbon Landscape" or "100,000
+    Trees" retrieve the corresponding case study without weakening retrieval
+    for unrelated BIONEXT content.
+    """
+    source_type = source["source_type"].lower()
+
+    # The case-study pages are currently stored as Oppla BIONEXT pages, so also
+    # recognise them from their canonical URL path.
+    source_url = (
+        source.get("url")
+        or source.get("source_url")
+        or ""
+    ).lower()
+
+    is_case_study_source = (
+        "bionext case study" in source_type
+        or "/bionext/case-study/" in source_url
+    )
+
+    if not is_case_study_source:
+        return 0.0
+
+    query_words = _normalised_title_words(question)
+    title_words = _normalised_title_words(source["parent_title"])
+
+    if not query_words or not title_words:
+        return 0.0
+
+    query_set = set(query_words)
+    title_set = set(title_words)
+    matched = query_set.intersection(title_set)
+
+    if not matched:
+        return 0.0
+
+    # A single distinctive title token such as "dartmoor" or "groasis" is
+    # enough for a shorthand-title match. Numeric tokens alone are not.
+    distinctive = [
+        word
+        for word in matched
+        if not word.isdigit() and len(word) >= 4
+    ]
+
+    if not distinctive:
+        return 0.0
+
+    coverage = len(matched) / max(len(query_set), 1)
+
+    # If all informative query tokens occur in the title, treat it as a strong
+    # title match. This is intentionally a ranking hint, not a replacement for
+    # semantic relevance.
+    if coverage >= 1.0:
+        return 0.120
+
+    if coverage >= 0.67:
+        return 0.085
+
+    if coverage >= 0.50:
+        return 0.060
+
+    return 0.035
+
+
 def concept_match_bonus(question, source):
     """
     Add a small exact-concept bonus for important domain terms whose short
@@ -1064,14 +1191,20 @@ def retrieve_sources(
             source,
         )
 
-        # Semantic relevance remains dominant. Source/concept bonuses are
+        title_match_bonus = case_study_title_match_score(
+            question,
+            source,
+        )
+
+        # Semantic relevance remains dominant. Source/concept/title bonuses are
         # deliberately small and only help clearly matching approved evidence
-        # rise above more generic decision-analysis material.
+        # rise above more generic material.
         combined_score = (
             semantic * 0.86
             + lexical * 0.14
             + priority
             + concept_bonus
+            + title_match_bonus
         )
 
         scored.append({
@@ -1080,6 +1213,7 @@ def retrieve_sources(
             "keyword_score": lexical,
             "priority_bonus": priority,
             "concept_bonus": concept_bonus,
+            "title_match_bonus": title_match_bonus,
             "retrieval_score": combined_score,
         })
 
@@ -1449,6 +1583,51 @@ def has_strong_mcda_evidence(question, retrieved):
     return False
 
 
+def has_strong_case_study_title_evidence(question, retrieved):
+    """
+    Return True when a short user query clearly identifies an approved BIONEXT
+    case study by a distinctive part of its title and that case study has been
+    retrieved with a credible score.
+
+    This is intentionally narrow and does not bypass the evidence gate for
+    generic topical queries.
+    """
+    if not question or not retrieved:
+        return False
+
+    for item in retrieved[:3]:
+        title_bonus = item.get(
+            "title_match_bonus",
+            case_study_title_match_score(question, item),
+        )
+
+        source_type = item["source_type"].lower()
+        source_url = (
+            item.get("url")
+            or item.get("source_url")
+            or ""
+        ).lower()
+
+        is_case_study_source = (
+            "bionext case study" in source_type
+            or "/bionext/case-study/" in source_url
+        )
+
+        if not is_case_study_source:
+            continue
+
+        # Require a clear partial-title match and a credible retrieval score.
+        if title_bonus < 0.060:
+            continue
+
+        if item.get("retrieval_score", 0.0) < 0.48:
+            continue
+
+        return True
+
+    return False
+
+
 # -------------------------------------------------------------------
 # Evidence answerability check
 # -------------------------------------------------------------------
@@ -1618,8 +1797,16 @@ def generate_answer(
         retrieved,
     )
 
+    strong_case_study_title_support = (
+        has_strong_case_study_title_evidence(
+            retrieval_question,
+            retrieved,
+        )
+    )
+
     if (
         not strong_mcda_support
+        and not strong_case_study_title_support
         and not evidence_supports_question(
             retrieval_question,
             groups,
@@ -2992,6 +3179,14 @@ if (
                                 "Strong MCDA evidence override: active"
                             )
 
+                        if has_strong_case_study_title_evidence(
+                            question,
+                            retrieved,
+                        ):
+                            st.caption(
+                                "Strong case-study title match: active"
+                            )
+
                         for item in retrieved:
                             st.write(
                                 f"**{item['title']}**"
@@ -3003,6 +3198,7 @@ if (
                                 f"keyword {item['keyword_score']:.3f} · "
                                 f"priority +{item['priority_bonus']:.3f} · "
                                 f"concept +{item.get('concept_bonus', 0.0):.3f} · "
+                                f"title +{item.get('title_match_bonus', 0.0):.3f} · "
                                 f"combined {item['retrieval_score']:.3f}"
                             )
 
